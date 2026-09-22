@@ -1,0 +1,46 @@
+{
+  "name": "pi-dogs",
+  "version": "0.0.0",
+  "description": "Interactive subagents for pi on native Windows: each subagent runs in its own Windows Terminal window, connected over a named pipe.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagents",
+    "windows-terminal"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "src",
+    "docs",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test \"test/unit/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": [
+      "./src/hub/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+*.log
+*.tgz
+.DS_Store
+Thumbs.db
+
+# Spike runtime artefacts
+spike/**/logs/
+spike/**/agentdir/
+
