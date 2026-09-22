@@ -29,4 +29,6 @@ the MIT License:
 
 Ideas taken from that project include spawning subagents as separate
 interactive pi sessions and returning their results to the parent agent.
-Any code adapted from it will be marked in the corresponding source file.
+Code adapted from it is marked in the corresponding source file:
+src/hub/session-seed.ts (session seeding and fork) and src/agent/summary.ts
+(finishing an autonomous run with its last assistant message).

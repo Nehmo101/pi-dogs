@@ -167,13 +167,14 @@ export class JsonlDecoder {
 
 type FieldSpec = "string" | "number" | "boolean" | "object" | readonly string[];
 
-const AGENT_STATES: readonly AgentState[] = ["starting", "running", "idle", "done", "failed", "killed"];
+const AGENT_STATES: readonly AgentState[] = ["starting", "running", "idle", "closing", "done", "failed", "killed"];
 
 /** Required payload fields per message type. A "?" suffix marks optional fields. */
 const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
-  hello: { token: "string", pid: "number", piVersion: "string", protocol: "number" },
-  welcome: { config: "object" },
+  hello: { token: "string", pid: "number", piVersion: "string", protocol: "number", "reconnect?": "boolean" },
+  welcome: { config: "object", resumed: "boolean" },
   reject: { reason: "string" },
+  ack: { ref: "string" },
   task: { text: "string" },
   status: { state: AGENT_STATES, "tool?": "string", usage: "object", model: "string" },
   event: { event: "object" },
@@ -181,13 +182,14 @@ const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
   abort: { reason: "string" },
   shutdown: {},
   takeover: {},
-  done: { summary: "string", usage: "object", sessionFile: "string" },
+  done: { summary: "string", usage: "object", sessionFile: "string", "error?": "string" },
+  bye: { reason: "string" },
   error: { message: "string", fatal: "boolean" },
   ping: {},
   pong: {},
 };
 
-const EVENT_KINDS = ["text_delta", "tool_start", "tool_end"];
+const EVENT_KINDS = ["text_delta", "tool_start", "tool_end", "user_message"];
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

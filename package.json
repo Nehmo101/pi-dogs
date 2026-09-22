@@ -23,8 +23,11 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "node --test \"test/unit/**/*.test.ts\"",
-    "typecheck": "tsc -p tsconfig.json"
+    "test": "node --test \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "pretypecheck": "node scripts/link-pi.mjs",
+    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/**/*.test.ts\"",
+    "test:wt": "node test/integration/wt/run.ts"
   },
   "pi": {
     "extensions": [
@@ -42,5 +45,8 @@
   "devDependencies": {
     "@types/node": "^24.13.6",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "koffi": "^3.3.1"
   }
 }

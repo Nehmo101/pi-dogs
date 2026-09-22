@@ -5,19 +5,25 @@
  * describe the visible window bounds. Compensating for invisible resize
  * borders or other platform quirks is the backend's job, not this module's.
  *
- * Rules (docs/PLAN.md, section 13):
- * 1. The main window sits on the left and prefers `mainFraction` of the width
- *    (50/50 with one agent). It never gets less than `mainMinFraction` of the
- *    width or `mainMinCols` terminal columns.
+ * Rules (docs/PLAN.md, sections 13 and 15; measured in docs/spike/layout.md):
+ * 1. The main window sits on the left of the primary work area and never gets
+ *    less than `mainMinCols` terminal columns.
  * 2. Agents fill the area to the right, depending on `arrangement`:
- *    - "columns": full-height columns side by side with equal widths. When a
- *      column would get narrower than the minimum, the agents wrap into
- *      another row of columns (up to `maxRows`).
- *    - "stacked": one column with equal heights. When a window would get
- *      shorter than the minimum, another column is added (up to `maxColumns`).
- * 3. If the agents still do not fit, the oldest ones are minimized instead of
+ *    - "columns" (default): as many full-height columns side by side as fit
+ *      with at least `agentMinCols` columns each. When more agents are
+ *      visible, they wrap into further rows of columns (up to `maxRows`),
+ *      each at least `agentMinRows` high.
+ *    - "stacked": one column with equal heights (each at least
+ *      `agentMinRows`); when that is full, another column is added (up to
+ *      `maxColumns`).
+ * 3. The main window's share adapts to the number of agent columns (see
+ *    {@link autoMainFraction}), clamped so the agents keep their minimum.
+ * 4. Optional secondary work areas (other monitors) take the agents that do
+ *    not fit next to the main window, before anything is minimized. They are
+ *    filled with the same rules, without a main window.
+ * 5. If the agents still do not fit, the oldest ones are minimized instead of
  *    shrinking everything.
- * 4. Rects are integers and, together with the gaps, tile the work area
+ * 6. Rects are integers and, together with the gaps, tile each work area
  *    exactly: no overlaps and no stray pixels from rounding.
  */
 
@@ -43,30 +49,48 @@ export type Arrangement = "columns" | "stacked";
 
 export interface LayoutPrefs {
   arrangement: Arrangement;
-  /** Size of one terminal cell in pixels at the current DPI scale. */
+  /** Size of one terminal cell in pixels at the current DPI scale (may be fractional). */
   cellSize: Size;
   /** Per-window overhead in pixels (title/tab bar, padding, scrollbar). */
   chrome: Size;
   mainMinCols: number;
   agentMinCols: number;
   agentMinRows: number;
-  /** Preferred share of the width for the main window. */
-  mainFraction: number;
-  /** Smallest share of the width the main window may shrink to. */
-  mainMinFraction: number;
-  /** "stacked" only: maximum number of agent columns. */
+  /**
+   * Preferred share of the primary work area's width for the main window:
+   * a number between 0 and 1, or "auto" to adapt it to the number of agent
+   * columns ({@link autoMainFraction}).
+   */
+  mainFraction: number | "auto";
+  /** "stacked" only: maximum number of agent columns per work area. */
   maxColumns: number;
-  /** "columns" only: maximum number of agent rows. */
+  /** "columns" only: maximum number of agent rows per work area. */
   maxRows: number;
   /** Gap between windows in pixels. The outer edges have no gap. */
   gap: number;
 }
 
+/** A further work area (another monitor) that may take agents that do not fit next to main. */
+export interface SecondaryWorkArea {
+  rect: Rect;
+  /** Cell size on that monitor if its DPI differs from the primary one. */
+  cellSize?: Size;
+  /** Window chrome on that monitor if its DPI differs from the primary one. */
+  chrome?: Size;
+}
+
+export interface LayoutOptions {
+  /** Used in order, only for agents that do not fit into the primary work area. */
+  secondaryWorkAreas?: readonly SecondaryWorkArea[];
+}
+
 export interface Layout {
   main: Rect;
   /**
-   * Visible agents, oldest first, in fill order: "columns" fills row by row,
-   * left to right; "stacked" fills column by column, top to bottom.
+   * Visible agents in fill order: per work area (primary first, then the
+   * secondary ones in order), oldest first; "columns" fills row by row, left
+   * to right, "stacked" column by column, top to bottom. The newest agents
+   * are on the primary work area, next to the main window.
    */
   agents: { id: string; rect: Rect }[];
   /** Ids of agents without a window (user- or auto-minimized), in input order. */
@@ -85,12 +109,29 @@ export const DEFAULT_LAYOUT_PREFS: Readonly<LayoutPrefs> = Object.freeze({
   mainMinCols: 100,
   agentMinCols: 80,
   agentMinRows: 16,
-  mainFraction: 0.5,
-  mainMinFraction: 0.45,
+  mainFraction: "auto",
   maxColumns: 2,
   maxRows: 2,
   gap: 0,
 });
+
+/**
+ * The main window's preferred share of the width with `k` agent columns next
+ * to it: 2 / (k + 3), i.e. 50 % with one column, 40 % with two, 33 % with
+ * three, 29 % with four.
+ *
+ * Why this curve: the spike measured exactly these shares as the most
+ * readable choices on 3440 px (1 agent: 50/50; 2: main 40 %, agents 110
+ * cols; 3: main 33 %, agents 81 cols; 2 x 2 grid: main 40 %). Read as weights,
+ * main gets 2 parts and the agent area k + 1 parts, so the main window is as
+ * wide as one agent column with one agent and approaches twice a column's
+ * width with many: the window you type in stays the widest, but never takes
+ * away a column that would fit at a readable width. The hard minimums
+ * (`mainMinCols`, `agentMinCols`) still win over this preference.
+ */
+export function autoMainFraction(agentColumns: number): number {
+  return 2 / (Math.max(1, agentColumns) + 3);
+}
 
 /** Default prefs with cell and chrome sizes scaled for a DPI scale factor (1.25 = 125 %). */
 export function layoutPrefsForScale(scale: number, overrides: Partial<LayoutPrefs> = {}): LayoutPrefs {
@@ -104,78 +145,149 @@ export function layoutPrefsForScale(scale: number, overrides: Partial<LayoutPref
   };
 }
 
-/** Minimum window sizes in pixels derived from prefs. */
-export function minimumSizes(workAreaWidth: number, prefs: LayoutPrefs): { main: number; agent: Size } {
+/** Minimum window sizes in pixels derived from prefs (cell sizes may be fractional). */
+export function minimumSizes(
+  prefs: Pick<LayoutPrefs, "cellSize" | "chrome" | "mainMinCols" | "agentMinCols" | "agentMinRows">,
+): { main: number; agent: Size } {
   const { cellSize: cell, chrome } = prefs;
   return {
-    main: Math.max(Math.ceil(prefs.mainMinFraction * workAreaWidth), prefs.mainMinCols * cell.w + chrome.w),
-    agent: { w: prefs.agentMinCols * cell.w + chrome.w, h: prefs.agentMinRows * cell.h + chrome.h },
+    main: Math.ceil(prefs.mainMinCols * cell.w + chrome.w),
+    agent: {
+      w: Math.ceil(prefs.agentMinCols * cell.w + chrome.w),
+      h: Math.ceil(prefs.agentMinRows * cell.h + chrome.h),
+    },
   };
+}
+
+/** One work area as seen by the placement code. */
+interface Area {
+  rect: Rect;
+  hasMain: boolean;
+  min: { main: number; agent: Size };
+  /** Agents per track at most (columns per row, or windows per column). */
+  perTrack: number;
+  /** Tracks that fit at most (rows of columns, or columns of windows). */
+  tracks: number;
 }
 
 export function computeLayout(
   workArea: Rect,
   agents: readonly LayoutAgent[],
   prefs: Partial<LayoutPrefs> = {},
+  options: LayoutOptions = {},
 ): Layout {
   const p: LayoutPrefs = { ...DEFAULT_LAYOUT_PREFS, ...prefs };
-  validate(workArea, agents, p);
+  const secondary = options.secondaryWorkAreas ?? [];
+  validate(workArea, secondary, agents, p);
 
+  const areas: Area[] = [
+    describeArea(workArea, true, p),
+    ...secondary.map((s) => describeArea(s.rect, false, { ...p, ...cellOverrides(s) })),
+  ];
   const visible = agents.filter((a) => !a.minimized);
-  const min = minimumSizes(workArea.width, p);
+  const maxLevel = Math.max(...areas.map((a) => a.tracks));
+  const capacity = (a: Area, level: number) => a.perTrack * Math.min(level, a.tracks);
+  const total = (level: number) => areas.reduce((sum, a) => sum + capacity(a, level), 0);
 
-  const maxTracks = p.arrangement === "columns" ? p.maxRows : p.maxColumns;
-  // Show as many of the newest agents as fit, with as few tracks as possible.
-  for (let n = visible.length; n > 0; n--) {
-    for (let tracks = 1; tracks <= Math.min(maxTracks, n); tracks++) {
-      const placed = place(workArea, visible.slice(visible.length - n), tracks, p, min);
-      if (!placed) continue;
-      const shown = new Set(placed.agents.map((a) => a.id));
-      return { ...placed, minimized: agents.filter((a) => !shown.has(a.id)).map((a) => a.id) };
-    }
-  }
-  return { main: { ...workArea }, agents: [], minimized: agents.map((a) => a.id) };
+  const shownCount = Math.min(visible.length, total(maxLevel));
+  // Use as few tracks as possible everywhere: find the lowest level at which
+  // everything fits, fill every area up to the level below, then hand out the
+  // rest in area order (primary first).
+  let level = 1;
+  while (level < maxLevel && total(level) < shownCount) level++;
+  const counts = areas.map((a) => capacity(a, level - 1));
+  let rest = shownCount - counts.reduce((sum, c) => sum + c, 0);
+  areas.forEach((a, i) => {
+    const add = Math.min(rest, capacity(a, level) - counts[i]!);
+    counts[i] = counts[i]! + add;
+    rest -= add;
+  });
+
+  // Newest agents on the primary area, the next older ones on the next area.
+  const shown = visible.slice(visible.length - shownCount);
+  let end = shown.length;
+  let main: Rect = { ...workArea };
+  const placed: { id: string; rect: Rect }[] = [];
+  areas.forEach((area, i) => {
+    const count = counts[i]!;
+    const group = shown.slice(end - count, end);
+    end -= count;
+    if (count === 0) return;
+    const result = place(area, group, Math.ceil(count / area.perTrack), p);
+    if (!result) throw new Error("computeLayout: internal error, capacity and placement disagree");
+    if (area.hasMain) main = result.main;
+    placed.push(...result.agents);
+  });
+
+  const ids = new Set(placed.map((a) => a.id));
+  return { main, agents: placed, minimized: agents.filter((a) => !ids.has(a.id)).map((a) => a.id) };
+}
+
+function cellOverrides(s: SecondaryWorkArea): Partial<LayoutPrefs> {
+  const out: Partial<LayoutPrefs> = {};
+  if (s.cellSize) out.cellSize = s.cellSize;
+  if (s.chrome) out.chrome = s.chrome;
+  return out;
+}
+
+function describeArea(rect: Rect, hasMain: boolean, p: LayoutPrefs): Area {
+  const min = minimumSizes(p);
+  const { gap } = p;
+  const width = hasMain ? rect.width - min.main - gap : rect.width;
+  const fit = (space: number, item: number) => (space >= item ? Math.floor((space + gap) / (item + gap)) : 0);
+  const cols = fit(width, min.agent.w);
+  const rows = fit(rect.height, min.agent.h);
+  const stacked = p.arrangement === "stacked";
+  const perTrack = stacked ? rows : cols;
+  const tracks = Math.min(stacked ? cols : rows, stacked ? p.maxColumns : p.maxRows);
+  const usable = perTrack > 0 && tracks > 0;
+  return { rect, hasMain, min, perTrack: usable ? perTrack : 0, tracks: usable ? tracks : 0 };
 }
 
 /**
- * Try to place all `agents` in `tracks` tracks: columns of stacked windows for
- * "stacked", rows of side-by-side windows for "columns". Earlier tracks take
+ * Place `agents` in `tracks` tracks: rows of side-by-side windows for
+ * "columns", columns of stacked windows for "stacked". Earlier tracks take
  * the remainder. Returns undefined if any minimum size would be violated.
  */
 function place(
-  area: Rect,
+  area: Area,
   agents: readonly LayoutAgent[],
   tracks: number,
   p: LayoutPrefs,
-  min: { main: number; agent: Size },
-): Omit<Layout, "minimized"> | undefined {
+): { main: Rect; agents: { id: string; rect: Rect }[] } | undefined {
   const { gap } = p;
+  const { rect: box, min } = area;
   const stacked = p.arrangement === "stacked";
   const perTrack = Math.ceil(agents.length / tracks);
   const gridCols = stacked ? tracks : perTrack;
   const gridRows = stacked ? perTrack : tracks;
-  if (gridRows * min.agent.h + (gridRows - 1) * gap > area.height) return undefined;
+  if (gridRows * min.agent.h + (gridRows - 1) * gap > box.height) return undefined;
 
   const agentsMinWidth = gridCols * min.agent.w + (gridCols - 1) * gap;
-  const maxMainWidth = area.width - gap - agentsMinWidth;
-  if (maxMainWidth < min.main) return undefined;
+  let mainWidth = 0;
+  if (area.hasMain) {
+    const maxMainWidth = box.width - gap - agentsMinWidth;
+    if (maxMainWidth < min.main) return undefined;
+    const fraction = p.mainFraction === "auto" ? autoMainFraction(gridCols) : p.mainFraction;
+    const preferred = Math.floor((box.width - gap) * fraction);
+    mainWidth = Math.max(min.main, Math.min(preferred, maxMainWidth));
+  } else if (agentsMinWidth > box.width) {
+    return undefined;
+  }
+  const main: Rect = { x: box.x, y: box.y, width: mainWidth, height: box.height };
 
-  const preferred = Math.floor((area.width - gap) * p.mainFraction);
-  const mainWidth = Math.max(min.main, Math.min(preferred, maxMainWidth));
-  const main: Rect = { x: area.x, y: area.y, width: mainWidth, height: area.height };
-
-  const agentsX = area.x + mainWidth + gap;
-  const agentsWidth = area.width - mainWidth - gap;
+  const agentsX = area.hasMain ? box.x + mainWidth + gap : box.x;
+  const agentsWidth = area.hasMain ? box.width - mainWidth - gap : box.width;
   const base = Math.floor(agents.length / tracks);
   const extra = agents.length % tracks;
   const placed: { id: string; rect: Rect }[] = [];
   let next = 0;
-  split(stacked ? agentsWidth : area.height, tracks, gap).forEach((track, t) => {
+  split(stacked ? agentsWidth : box.height, tracks, gap).forEach((track, t) => {
     const count = base + (t < extra ? 1 : 0);
-    for (const item of split(stacked ? area.height : agentsWidth, count, gap)) {
+    for (const item of split(stacked ? box.height : agentsWidth, count, gap)) {
       const rect: Rect = stacked
-        ? { x: agentsX + track.offset, y: area.y + item.offset, width: track.size, height: item.size }
-        : { x: agentsX + item.offset, y: area.y + track.offset, width: item.size, height: track.size };
+        ? { x: agentsX + track.offset, y: box.y + item.offset, width: track.size, height: item.size }
+        : { x: agentsX + item.offset, y: box.y + track.offset, width: item.size, height: track.size };
       placed.push({ id: agents[next++]!.id, rect });
     }
   });
@@ -197,29 +309,43 @@ function split(total: number, parts: number, gap: number): { offset: number; siz
   return segments;
 }
 
-function validate(area: Rect, agents: readonly LayoutAgent[], p: LayoutPrefs): void {
-  const ints: [string, number][] = [
-    ["workArea.x", area.x],
-    ["workArea.y", area.y],
-    ["workArea.width", area.width],
-    ["workArea.height", area.height],
-    ["gap", p.gap],
-    ["maxColumns", p.maxColumns],
-    ["maxRows", p.maxRows],
-  ];
-  for (const [name, value] of ints) {
+function validateRect(name: string, r: Rect): void {
+  for (const key of ["x", "y", "width", "height"] as const) {
+    if (!Number.isInteger(r[key])) throw new RangeError(`${name}.${key} must be an integer, got ${r[key]}`);
+  }
+  if (r.width <= 0 || r.height <= 0) throw new RangeError(`${name} must have a positive size`);
+}
+
+function validateCells(name: string, cell: Size | undefined, chrome: Size | undefined): void {
+  if (cell && !(cell.w > 0 && cell.h > 0)) throw new RangeError(`${name}cellSize must be positive`);
+  if (chrome && !(chrome.w >= 0 && chrome.h >= 0)) throw new RangeError(`${name}chrome must not be negative`);
+}
+
+function validate(
+  area: Rect,
+  secondary: readonly SecondaryWorkArea[],
+  agents: readonly LayoutAgent[],
+  p: LayoutPrefs,
+): void {
+  validateRect("workArea", area);
+  secondary.forEach((s, i) => {
+    validateRect(`secondaryWorkAreas[${i}].rect`, s.rect);
+    validateCells(`secondaryWorkAreas[${i}].`, s.cellSize, s.chrome);
+  });
+  for (const [name, value] of [["gap", p.gap], ["maxColumns", p.maxColumns], ["maxRows", p.maxRows]] as const) {
     if (!Number.isInteger(value)) throw new RangeError(`${name} must be an integer, got ${value}`);
   }
-  if (area.width <= 0 || area.height <= 0) throw new RangeError("workArea must have a positive size");
   if (p.gap < 0) throw new RangeError("gap must not be negative");
   if (p.arrangement !== "columns" && p.arrangement !== "stacked") {
     throw new RangeError(`arrangement must be "columns" or "stacked", got ${String(p.arrangement)}`);
   }
   if (p.maxColumns < 1 || p.maxRows < 1) throw new RangeError("maxColumns and maxRows must be at least 1");
-  if (!(p.cellSize.w > 0 && p.cellSize.h > 0)) throw new RangeError("cellSize must be positive");
-  if (!(p.chrome.w >= 0 && p.chrome.h >= 0)) throw new RangeError("chrome must not be negative");
-  for (const name of ["mainFraction", "mainMinFraction"] as const) {
-    if (!(p[name] > 0 && p[name] < 1)) throw new RangeError(`${name} must be between 0 and 1, got ${p[name]}`);
+  validateCells("", p.cellSize, p.chrome);
+  for (const name of ["mainMinCols", "agentMinCols", "agentMinRows"] as const) {
+    if (!(p[name] >= 1)) throw new RangeError(`${name} must be at least 1, got ${p[name]}`);
+  }
+  if (p.mainFraction !== "auto" && !(p.mainFraction > 0 && p.mainFraction < 1)) {
+    throw new RangeError(`mainFraction must be "auto" or between 0 and 1, got ${String(p.mainFraction)}`);
   }
   const ids = new Set<string>();
   for (const { id } of agents) {

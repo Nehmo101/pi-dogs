@@ -15,7 +15,15 @@ const usage = { input: 1200, output: 340, cost: 0.0042 };
 
 const SAMPLES: Message[] = [
   { v: 1, type: "hello", agentId: "scout", token: "t0k3n", pid: 4242, piVersion: "0.87.1", protocol: 1 },
-  { v: 1, type: "welcome", agentId: "scout", config: { eventDetail: "minimal" } },
+  { v: 1, type: "hello", agentId: "scout", token: "t0k3n", pid: 4242, piVersion: "0.87.1", protocol: 1, reconnect: true },
+  {
+    v: 1,
+    type: "welcome",
+    agentId: "scout",
+    config: { mode: "autonomous", closeOnDone: true, hubGoneGraceMs: 30000, name: "Bello Baggins" },
+    resumed: false,
+  },
+  { v: 1, type: "ack", agentId: "scout", ref: "done-1" },
   { v: 1, type: "reject", agentId: "scout", reason: "invalid token" },
   { v: 1, type: "task", agentId: "scout", id: "req-1", text: "Find all callers of createSurface" },
   { v: 1, type: "status", agentId: "scout", state: "running", tool: "bash", usage, model: "qwen3.5:4b" },
@@ -28,6 +36,10 @@ const SAMPLES: Message[] = [
   { v: 1, type: "shutdown", agentId: "scout" },
   { v: 1, type: "takeover", agentId: "scout" },
   { v: 1, type: "done", agentId: "scout", summary: "Found 3 callers.", usage, sessionFile: "C:\\tmp\\s.jsonl" },
+  { v: 1, type: "done", agentId: "scout", id: "done-1", summary: "", usage, sessionFile: "s.jsonl", error: "overloaded" },
+  { v: 1, type: "bye", agentId: "scout", reason: "quit" },
+  { v: 1, type: "status", agentId: "scout", state: "closing", usage, model: "qwen3.5:4b" },
+  { v: 1, type: "event", agentId: "scout", event: { kind: "user_message", text: "hi", source: "user" } },
   { v: 1, type: "error", agentId: "scout", message: "model unavailable", fatal: true },
   { v: 1, type: "ping", agentId: "scout", id: "p-7" },
   { v: 1, type: "pong", agentId: "scout", id: "p-7" },

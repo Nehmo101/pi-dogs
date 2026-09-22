@@ -32,6 +32,14 @@ export interface PaneRef {
 export interface BackendEvents {
   /** The window disappeared (closed by the user or its process exited). */
   onClosed?(ref: PaneRef): void;
+  /**
+   * The window was minimized or restored without a minimize()/restore() call:
+   * "auto" when the layout ran out of room (or got room again), "user" when
+   * the user did it from the taskbar or title bar. Lets the hub keep its
+   * agent list and mirror view in sync. Optional; backends without an
+   * automatic layout never emit it.
+   */
+  onMinimizedChange?(ref: PaneRef, minimized: boolean, reason: "auto" | "user"): void;
 }
 
 export interface PaneBackend {

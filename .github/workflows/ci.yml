@@ -15,5 +15,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # Type declarations only: scripts/link-pi.mjs links the global pi into node_modules.
+      - run: npm install -g @earendil-works/pi-coding-agent@0.87.1
       - run: npm run typecheck
       - run: npm test

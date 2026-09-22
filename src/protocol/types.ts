@@ -7,8 +7,18 @@
  */
 import type { ProtocolVersion } from "./version.ts";
 
-/** Lifecycle states of an agent, as tracked by the hub registry. */
-export type AgentState = "starting" | "running" | "idle" | "done" | "failed" | "killed";
+/**
+ * Lifecycle states of an agent, as tracked by the hub registry.
+ *
+ * - `starting`: window opened, waiting for `hello`.
+ * - `running` / `idle`: connected; working on a turn or waiting for input.
+ * - `closing`: finished or asked to stop; accepts no more work.
+ * - `done` / `failed` / `killed`: terminal states.
+ */
+export type AgentState = "starting" | "running" | "idle" | "closing" | "done" | "failed" | "killed";
+
+/** How an agent finishes: on its own (autonomous) or only when told to (interactive). */
+export type AgentMode = "autonomous" | "interactive";
 
 /** Token usage and cost, cumulative for the agent session. */
 export interface Usage {
@@ -20,11 +30,24 @@ export interface Usage {
   cost?: number;
 }
 
+/** Settings the hub sends to an agent in `welcome`. */
+export interface AgentConfig {
+  mode: AgentMode;
+  /** Quit the agent pi after its `done` has been acknowledged. */
+  closeOnDone: boolean;
+  /** How long the agent keeps trying to reconnect before it assumes the hub is gone. */
+  hubGoneGraceMs: number;
+  /** Display name, for the agent's own UI. */
+  name: string;
+}
+
 /** Filtered pi events forwarded for the live mirror view. */
 export type AgentEvent =
   | { kind: "text_delta"; text: string }
   | { kind: "tool_start"; toolCallId: string; tool: string; args?: string }
-  | { kind: "tool_end"; toolCallId: string; tool: string; isError: boolean };
+  | { kind: "tool_end"; toolCallId: string; tool: string; isError: boolean }
+  /** A user message entered the agent's session, from the hub (task/steer) or typed by hand. */
+  | { kind: "user_message"; text: string; source: "hub" | "user" };
 
 interface Envelope<T extends string> {
   v: ProtocolVersion;
@@ -41,6 +64,8 @@ export interface HelloMessage extends Envelope<"hello"> {
   piVersion: string;
   /** Highest protocol version the agent speaks. */
   protocol: number;
+  /** True when the agent reconnects after losing the pipe (it already received its task). */
+  reconnect?: boolean;
 }
 
 export interface StatusMessage extends Envelope<"status"> {
@@ -57,10 +82,21 @@ export interface EventMessage extends Envelope<"event"> {
 
 export type TakeoverMessage = Envelope<"takeover">;
 
+/**
+ * The agent finished. Sent with an `id`; the agent re-sends it after a
+ * reconnect until the hub answers with a matching `ack`.
+ */
 export interface DoneMessage extends Envelope<"done"> {
   summary: string;
   usage: Usage;
   sessionFile: string;
+  /** Set when the run ended with a model/provider error instead of a result. */
+  error?: string;
+}
+
+/** The agent pi is shutting down (`reason` is pi's shutdown reason, e.g. "quit"). */
+export interface ByeMessage extends Envelope<"bye"> {
+  reason: string;
 }
 
 export interface ErrorMessage extends Envelope<"error"> {
@@ -71,7 +107,14 @@ export interface ErrorMessage extends Envelope<"error"> {
 // Hub -> agent
 
 export interface WelcomeMessage extends Envelope<"welcome"> {
-  config: Record<string, unknown>;
+  config: AgentConfig;
+  /** True when the hub already knows this agent (reconnect); no new `task` follows. */
+  resumed: boolean;
+}
+
+/** Acknowledges a message that carried an `id` (currently `done`). */
+export interface AckMessage extends Envelope<"ack"> {
+  ref: string;
 }
 
 export interface RejectMessage extends Envelope<"reject"> {
@@ -105,6 +148,7 @@ export type AgentToHubMessage =
   | EventMessage
   | TakeoverMessage
   | DoneMessage
+  | ByeMessage
   | ErrorMessage
   | PingMessage
   | PongMessage;
@@ -112,6 +156,7 @@ export type AgentToHubMessage =
 export type HubToAgentMessage =
   | WelcomeMessage
   | RejectMessage
+  | AckMessage
   | TaskMessage
   | SteerMessage
   | AbortMessage
