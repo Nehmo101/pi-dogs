@@ -21,9 +21,14 @@
  * 4. Optional secondary work areas (other monitors) take the agents that do
  *    not fit next to the main window, before anything is minimized. They are
  *    filled with the same rules, without a main window.
- * 5. If the agents still do not fit, the oldest ones are minimized instead of
+ * 5. If not even one agent fits next to main (small or highly scaled
+ *    screens), the minimums are relaxed step by step ({@link relaxPrefs}):
+ *    first main may shrink to `agentMinCols`, then main and agents split the
+ *    area 50/50 as long as each half keeps at least {@link RELAXED_MIN_COLS}
+ *    columns. Rows (up to `maxRows`) then work as usual.
+ * 6. If the agents still do not fit, the oldest ones are minimized instead of
  *    shrinking everything.
- * 6. Rects are integers and, together with the gaps, tile each work area
+ * 7. Rects are integers and, together with the gaps, tile each work area
  *    exactly: no overlaps and no stray pixels from rounding.
  */
 
@@ -159,6 +164,41 @@ export function minimumSizes(
   };
 }
 
+/**
+ * Narrowest window (in columns) the relaxation in {@link relaxPrefs} accepts.
+ * Below this, terminal UIs wrap badly; minimizing is the better choice.
+ */
+export const RELAXED_MIN_COLS = 60;
+
+/**
+ * The prefs a work area is laid out with. Normally `p` unchanged; only when
+ * not even one agent would fit (capacity 0) are the minimums relaxed:
+ * 1. with main: main may shrink to `agentMinCols` (main and agent equally wide),
+ * 2. main and agents (without main: the agents) get the widest column count
+ *    that still fits two windows side by side (one without main), provided
+ *    that is at least {@link RELAXED_MIN_COLS}.
+ * Pure and deterministic. Exported so tests and diagnostics can see the
+ * minimums that were actually used.
+ */
+export function relaxPrefs(rect: Rect, hasMain: boolean, p: LayoutPrefs): LayoutPrefs {
+  if (capacityOf(rect, hasMain, p) > 0) return p;
+  if (hasMain && p.mainMinCols > p.agentMinCols) {
+    const shrunk = { ...p, mainMinCols: p.agentMinCols };
+    if (capacityOf(rect, hasMain, shrunk) > 0) return shrunk;
+  }
+  const windows = hasMain ? 2 : 1;
+  const slot = Math.floor((rect.width - (windows - 1) * p.gap) / windows);
+  const cols = Math.floor((slot - p.chrome.w) / p.cellSize.w);
+  if (cols < RELAXED_MIN_COLS || cols >= p.agentMinCols) return p;
+  const relaxed = { ...p, mainMinCols: Math.min(p.mainMinCols, cols), agentMinCols: cols };
+  return capacityOf(rect, hasMain, relaxed) > 0 ? relaxed : p;
+}
+
+function capacityOf(rect: Rect, hasMain: boolean, p: LayoutPrefs): number {
+  const a = describeArea(rect, hasMain, p);
+  return a.perTrack * a.tracks;
+}
+
 /** One work area as seen by the placement code. */
 interface Area {
   rect: Rect;
@@ -181,8 +221,11 @@ export function computeLayout(
   validate(workArea, secondary, agents, p);
 
   const areas: Area[] = [
-    describeArea(workArea, true, p),
-    ...secondary.map((s) => describeArea(s.rect, false, { ...p, ...cellOverrides(s) })),
+    describeArea(workArea, true, relaxPrefs(workArea, true, p)),
+    ...secondary.map((s) => {
+      const sp = { ...p, ...cellOverrides(s) };
+      return describeArea(s.rect, false, relaxPrefs(s.rect, false, sp));
+    }),
   ];
   const visible = agents.filter((a) => !a.minimized);
   const maxLevel = Math.max(...areas.map((a) => a.tracks));

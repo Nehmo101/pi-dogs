@@ -10,6 +10,8 @@ export interface SimAgentOptions {
   pid?: number;
   /** Override the token from the launch file (to test rejection). */
   token?: string;
+  /** Override the expected hub secret (to test hub verification). */
+  hubSecret?: string;
   /** Answer `shutdown` like pi does: bye, then disconnect. Default true. */
   obeyShutdown?: boolean;
   backoffMs?: number[];
@@ -22,12 +24,14 @@ export class SimAgent {
   hubGone: string | undefined;
   #waiters: Array<{ match: (m: HubToAgentMessage) => boolean; resolve: (m: HubToAgentMessage) => void }> = [];
 
-  constructor(launchFile: string, options: SimAgentOptions = {}) {
-    this.launch = consumeLaunchFile(launchFile);
+  /** `launchFile` may also be an already consumed launch file (a second process of the same dog). */
+  constructor(launchFile: string | LaunchFile, options: SimAgentOptions = {}) {
+    this.launch = typeof launchFile === "string" ? consumeLaunchFile(launchFile) : launchFile;
     this.client = new AgentClient({
       pipe: this.launch.pipe,
       agentId: this.launch.agentId,
       token: options.token ?? this.launch.token,
+      hubSecret: options.hubSecret ?? this.launch.hubSecret,
       pid: options.pid ?? process.pid,
       piVersion: "0.0.0-test",
       backoffMs: options.backoffMs ?? [20, 40, 80],

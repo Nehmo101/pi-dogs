@@ -53,6 +53,8 @@ export interface DogRecord {
   agentId: string;
   name: string;
   token: string;
+  /** Echoed in `welcome` so the dog can tell the real hub from a squatter. */
+  hubSecret: string;
   color: string;
   /** Model as `provider/id`, plus the thinking level if one was requested. */
   model: string;
@@ -88,6 +90,13 @@ export interface DogRecord {
   /** What to become once the process is gone, while `closing`. */
   closingTarget?: "done" | "killed";
   closingReason?: string;
+  /** How to report a kill once the dog is gone (kept here so it survives a /reload). */
+  closingReport?: boolean;
+  closingTriggerTurn?: boolean;
+  /** The user closed the dog's window (reported as killed, not as a crash). */
+  windowClosed?: boolean;
+  /** Main session epoch at spawn; bumped by /new and /resume in the main pi. */
+  sessionEpoch?: number;
   /** Result reported by the dog (kept for `subagent_list` and the overlay). */
   summary?: string;
   outcome?: DogOutcome;
@@ -106,12 +115,27 @@ export interface RegistrySnapshot {
   records: DogRecord[];
 }
 
+/**
+ * Remove C0/C1 control characters (ESC sequences included) except newline and
+ * tab: mirrored text is drawn into the main pi's terminal and must not be able
+ * to move the cursor, change colours or set the window title.
+ */
+export function stripControls(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+}
+
 export class Registry {
   readonly #records = new Map<string, DogRecord>();
   readonly #mirrorLimit: number;
 
   constructor(options: { mirrorLimit?: number } = {}) {
     this.#mirrorLimit = options.mirrorLimit ?? 400;
+  }
+
+  /** Drop the oldest finished dogs beyond `keep`, so snapshots and lists stay small. */
+  pruneTerminal(keep: number): void {
+    const finished = this.all().filter((r) => isTerminal(r.state));
+    for (const record of finished.slice(0, Math.max(0, finished.length - keep))) this.#records.delete(record.agentId);
   }
 
   static restore(snapshot: RegistrySnapshot, options: { mirrorLimit?: number } = {}): Registry {
@@ -215,7 +239,7 @@ export class Registry {
     const mirror = record.mirror;
     switch (event.kind) {
       case "text_delta": {
-        const [first = "", ...rest] = event.text.split("\n");
+        const [first = "", ...rest] = stripControls(event.text).split("\n");
         let last = mirror[mirror.length - 1];
         if (last?.kind !== "text") {
           last = { kind: "text", text: "" };
@@ -228,8 +252,8 @@ export class Registry {
       case "tool_start":
         mirror.push(
           event.args === undefined
-            ? { kind: "tool", tool: event.tool, status: "running", toolCallId: event.toolCallId }
-            : { kind: "tool", tool: event.tool, args: event.args, status: "running", toolCallId: event.toolCallId },
+            ? { kind: "tool", tool: stripControls(event.tool), status: "running", toolCallId: event.toolCallId }
+            : { kind: "tool", tool: stripControls(event.tool), args: stripControls(event.args), status: "running", toolCallId: event.toolCallId },
         );
         break;
       case "tool_end": {
@@ -243,7 +267,7 @@ export class Registry {
         break;
       }
       case "user_message":
-        mirror.push({ kind: "user", text: event.text, source: event.source });
+        mirror.push({ kind: "user", text: stripControls(event.text), source: event.source });
         break;
     }
     this.#trim(record);

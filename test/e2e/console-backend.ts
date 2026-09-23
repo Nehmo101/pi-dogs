@@ -19,7 +19,16 @@ export class ConsoleBackend implements PaneBackend {
   }
 
   async open(spec: OpenSpec): Promise<PaneRef> {
-    const child = spawn(spec.command, spec.args, { cwd: spec.cwd, detached: true, stdio: "ignore", windowsHide: false });
+    // A detached child with stdio "ignore" gets NUL handles, not its new console: pi would
+    // see no TTY and exit at once. `start /wait` gives the launcher a real console window.
+    const quote = (s: string) => `"${s.replace(/"/g, '""')}"`;
+    const line = ["start", quote(`pi-dogs ${spec.name}`), "/wait", quote(spec.command), ...spec.args.map(quote)].join(" ");
+    const child = spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${line}"`], {
+      cwd: spec.cwd,
+      stdio: "ignore",
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    });
     this.#children.set(spec.agentId, child);
     child.on("exit", () => {
       this.#children.delete(spec.agentId);

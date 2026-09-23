@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   consumeLaunchFile,
   describeExit,
+  newPipeName,
   pipeNameForPid,
   readExitFile,
   runRootForPid,
@@ -31,6 +32,7 @@ const sample = (over: Partial<LaunchFile> = {}): LaunchFile => ({
   name: "Rex",
   pipe: pipeNameForPid(123),
   token: "secret",
+  hubSecret: "hub-secret",
   cwd: dir,
   exitFile: join(dir, "exit.json"),
   pi: { command: process.execPath, args: ["-e", "process.exit(0)"] },
@@ -65,6 +67,17 @@ describe("launch file", () => {
     assert.equal(pipeNameForPid(4242, "win32"), "\\\\.\\pipe\\pi-dogs-4242");
     assert.match(pipeNameForPid(4242, "linux"), /pi-dogs-4242\.sock$/);
     assert.equal(runRootForPid(7, "C:\\tmp"), join("C:\\tmp", "pi-dogs", "7"));
+  });
+
+  it("makes the pipe name unpredictable", () => {
+    const a = newPipeName(4242, "win32");
+    assert.match(a, /^\\\\\.\\pipe\\pi-dogs-4242-[0-9a-f]{16}$/);
+    assert.notEqual(a, newPipeName(4242, "win32"));
+  });
+
+  it("requires the hub secret", () => {
+    const { hubSecret: _drop, ...without } = sample();
+    assert.throws(() => validateLaunchFile(without), /"hubSecret"/);
   });
 });
 
@@ -123,6 +136,14 @@ describe("launcher.mjs", () => {
     const result = spawnSync(process.execPath, [LAUNCHER], { encoding: "utf8" });
     assert.equal(result.status, 0);
     assert.match(result.stderr, /usage/);
+  });
+
+  it("runs when reached through a junction or symlink", () => {
+    const link = join(dir, "linked");
+    symlinkSync(dirname(LAUNCHER), link, "junction");
+    const result = spawnSync(process.execPath, [join(link, "launcher.mjs")], { encoding: "utf8" });
+    assert.equal(result.status, 0);
+    assert.match(result.stderr, /usage/, "main() ran although argv[1] is not the real path");
   });
 
   it("resolves a bare pi command through the npm shim to node + cli.js", async () => {

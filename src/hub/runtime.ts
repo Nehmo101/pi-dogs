@@ -4,18 +4,19 @@
  * must survive a `/reload` (kept on globalThis, see `carryOver`).
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { hasTrustRequiringProjectResources, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { PaneBackend } from "../backend/pane-backend.ts";
-import { pipeNameForPid, runRootForPid } from "../protocol/launch.ts";
+import { newPipeName, runRootForPid } from "../protocol/launch.ts";
 import { createBackend } from "./backend.ts";
 import type { PiDogsConfig } from "./config.ts";
 import { Hub, type HubHost } from "./hub.ts";
 import { modelRef as refOf, type ModelInfo } from "./models.ts";
-import { currentPiCommand } from "./pi-command.ts";
+import { currentPiCommand, dogProjectTrust } from "./pi-command.ts";
 import { isPidAlive } from "./process.ts";
 import { Registry, type RegistrySnapshot } from "./registry.ts";
 import { DockComponent } from "./ui/dock.ts";
@@ -34,6 +35,12 @@ interface CarryOver {
   snapshot?: RegistrySnapshot;
   sessionDefaultModel?: string | undefined;
   sessionRoles?: Record<string, string>;
+  /** Random pipe name, chosen once per main pi process (dogs reconnect to it after /reload). */
+  pipe?: string;
+  /** Bumped on /new and /resume (see Hub.sessionEpoch). */
+  sessionEpoch?: number;
+  /** Dog windows that closed while no hub listened to the backend. */
+  closedWhileAway?: string[];
 }
 
 const CARRY_KEY = Symbol.for("pi-dogs.carry-over.v1");
@@ -87,10 +94,14 @@ export class HubRuntime {
     return this.#startError;
   }
 
-  async start(ctx: ExtensionContext): Promise<void> {
+  /** `reason` is pi's session_start reason ("startup", "reload", "new", "resume", "fork"). */
+  async start(ctx: ExtensionContext, reason = "startup"): Promise<void> {
     this.ctx = ctx;
     removeStaleRunRoots();
     const carry = carryOver();
+    // A new conversation: results of dogs from the previous one must not start a turn here.
+    if (reason === "new" || reason === "resume") carry.sessionEpoch = (carry.sessionEpoch ?? 0) + 1;
+    carry.pipe ??= newPipeName(process.pid);
     let backend = carry.backend;
     if (!backend) {
       try {
@@ -104,7 +115,7 @@ export class HubRuntime {
     delete carry.snapshot;
 
     const hub = new Hub({
-      pipe: pipeNameForPid(process.pid),
+      pipe: carry.pipe,
       runRoot: runRootForPid(process.pid),
       agentExtension: AGENT_EXTENSION_PATH,
       launcher: LAUNCHER_PATH,
@@ -117,10 +128,13 @@ export class HubRuntime {
     });
     hub.sessionDefaultModel = carry.sessionDefaultModel;
     Object.assign(hub.sessionRoles, carry.sessionRoles ?? {});
+    hub.sessionEpoch = carry.sessionEpoch ?? 0;
     try {
       await hub.start();
       this.hub = hub;
       this.#startError = undefined;
+      // The new Hub subscribed to the backend in its constructor; replay what it missed.
+      for (const agentId of carry.closedWhileAway?.splice(0) ?? []) hub.windowClosed(agentId);
     } catch (err) {
       this.#startError = `pi-dogs could not listen on ${hub.pipe}: ${(err as Error).message}`;
       this.notify(this.#startError, "error");
@@ -146,6 +160,7 @@ export class HubRuntime {
       carry.backend?.dispose();
       delete carry.backend;
       delete carry.snapshot;
+      delete carry.pipe;
       rmSync(runRootForPid(process.pid), { recursive: true, force: true });
       return;
     }
@@ -153,6 +168,9 @@ export class HubRuntime {
     carry.sessionDefaultModel = hub.sessionDefaultModel;
     carry.sessionRoles = { ...hub.sessionRoles };
     await hub.stop(reason);
+    // Until the next runtime's Hub subscribes, remember windows that close in between.
+    const closed = (carry.closedWhileAway ??= []);
+    carry.backend?.setEvents({ onClosed: (ref) => void closed.push(ref.agentId) });
   }
 
   requireHub(): Hub {
@@ -186,8 +204,23 @@ export class HubRuntime {
     return join(this.agentDir, "sessions", "pi-dogs");
   }
 
+  /** `approve` for a dog started in `cwd` (see dogProjectTrust). */
+  dogTrust(ctx: ExtensionContext, cwd: string): boolean | undefined {
+    return dogProjectTrust({
+      cwd,
+      mainCwd: ctx.cwd,
+      mainTrusted: ctx.isProjectTrusted(),
+      needsTrust: hasTrustRequiringProjectResources,
+      storedDecision: (dir) => new ProjectTrustStore(this.agentDir).get(dir),
+    });
+  }
+
   notify(text: string, level: "info" | "warning" | "error" = "info"): void {
-    if (this.ctx?.hasUI) this.ctx.ui.notify(text, level);
+    try {
+      if (this.ctx?.hasUI) this.ctx.ui.notify(text, level);
+    } catch {
+      // A ctx from a replaced session throws; a lost notification is harmless.
+    }
   }
 
   /** Open the mirror overlay, optionally on a specific dog. */
@@ -219,7 +252,8 @@ export class HubRuntime {
               },
               restore: (dog) => void this.hub?.restore(dog).catch((e: Error) => this.notify(e.message, "warning")),
               minimize: (dog) => void this.hub?.minimize(dog).catch((e: Error) => this.notify(e.message, "warning")),
-              kill: (dog) => void this.hub?.kill(dog, "stopped by the user", { report: true, triggerTurn: false }),
+              kill: (dog) =>
+                void this.hub?.kill(dog, "stopped by the user", { report: true, triggerTurn: false }).catch((e: Error) => this.notify(e.message, "warning")),
               seen: (dog) => this.hub?.markSeen(dog),
             },
             () => done(undefined),

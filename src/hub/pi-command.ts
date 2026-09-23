@@ -2,7 +2,7 @@
  * How the hub starts a dog's pi: which executable, and with which arguments.
  */
 import { existsSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, resolve } from "node:path";
 
 export interface PiCommand {
   command: string;
@@ -37,8 +37,40 @@ export interface PiArgsOptions {
   tools?: readonly string[] | undefined;
   /** Session display name (also makes pi's terminal title show the dog's name). */
   name: string;
-  /** Trust project-local resources, when the main pi already trusts them. */
-  approve?: boolean;
+  /**
+   * Project trust: true passes `--approve`, false `--no-approve` (either way
+   * pi never shows its trust prompt), undefined leaves the decision to pi.
+   */
+  approve?: boolean | undefined;
+}
+
+/**
+ * Project trust for a dog's pi, chosen so that the dog never sits at pi's
+ * "Trust project folder?" prompt (it would miss the hub's hello timeout) and
+ * never gets more trust than the user gave:
+ *
+ * - same folder as the main pi: the main pi's decision (`--approve` / `--no-approve`);
+ * - another folder without project resources: undefined (pi does not ask);
+ * - another folder with a remembered decision: that decision;
+ * - otherwise: false (`--no-approve`, project-local resources stay off).
+ */
+export function dogProjectTrust(o: {
+  cwd: string;
+  mainCwd: string;
+  mainTrusted: boolean;
+  /** pi's hasTrustRequiringProjectResources. */
+  needsTrust: (cwd: string) => boolean;
+  /** pi's ProjectTrustStore.get: true, false, or null when nothing is remembered. */
+  storedDecision: (cwd: string) => boolean | null;
+}): boolean | undefined {
+  const same = (a: string, b: string) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+  if (same(resolve(o.cwd), resolve(o.mainCwd))) return o.mainTrusted;
+  try {
+    if (!o.needsTrust(o.cwd)) return undefined;
+    return o.storedDecision(o.cwd) ?? false;
+  } catch {
+    return false;
+  }
 }
 
 /** Command-line arguments for a dog's pi. The task is never passed here (it would look like typed input). */
@@ -50,6 +82,7 @@ export function buildPiArgs(o: PiArgsOptions): string[] {
     const tools = [...new Set([...o.tools.map((t) => t.trim()).filter(Boolean), "subagent_done"])];
     args.push("--tools", tools.join(","));
   }
-  if (o.approve) args.push("--approve");
+  if (o.approve === true) args.push("--approve");
+  else if (o.approve === false) args.push("--no-approve");
   return args;
 }

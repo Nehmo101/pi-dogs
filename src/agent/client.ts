@@ -9,7 +9,12 @@
  *
  * `done` must not get lost across such a gap: `sendReliable` keeps a message
  * and re-sends it after every reconnect until the hub acknowledges it.
+ *
+ * The client trusts a peer only after a `welcome` that carries the hub secret
+ * from the launch file; everything a peer sends before that is ignored, so a
+ * process squatting on the pipe name cannot steer or stop the dog.
  */
+import { timingSafeEqual } from "node:crypto";
 import net from "node:net";
 
 import { encodeMessage, JsonlDecoder } from "../protocol/framing.ts";
@@ -23,6 +28,8 @@ export interface AgentClientOptions {
   pipe: string;
   agentId: string;
   token: string;
+  /** Secret the real hub echoes in `welcome` (and in a `reject` for a known agent). */
+  hubSecret: string;
   pid: number;
   piVersion: string;
   /** Every message from the hub except ping/pong and acks. */
@@ -42,8 +49,11 @@ export interface AgentClientOptions {
 
 const DEFAULT_BACKOFF = [100, 250, 500, 1000, 2000] as const;
 
+/** Callbacks that a new extension runtime (after /reload in the dog) can re-bind. */
+export type AgentClientHandlers = Pick<AgentClientOptions, "onMessage" | "onReady" | "onDisconnected" | "onHubGone">;
+
 export class AgentClient {
-  readonly #o: AgentClientOptions;
+  #o: AgentClientOptions;
   #socket: net.Socket | undefined;
   #ready = false;
   #welcomed = false;
@@ -69,6 +79,22 @@ export class AgentClient {
     this.#hubGoneGraceMs = ms;
   }
 
+  /** Replace the callbacks (the dog's pi re-created its extension runtime). */
+  setHandlers(handlers: AgentClientHandlers): void {
+    const { onReady, onDisconnected, ...required } = handlers;
+    const next: AgentClientOptions = { ...this.#o, ...required };
+    if (onReady) next.onReady = onReady;
+    else delete next.onReady;
+    if (onDisconnected) next.onDisconnected = onDisconnected;
+    else delete next.onDisconnected;
+    this.#o = next;
+  }
+
+  /** True once `close()` was called or the hub was given up. */
+  get closed(): boolean {
+    return this.#closed;
+  }
+
   connect(): void {
     if (this.#closed || this.#socket) return;
     this.#disconnectedSince ??= Date.now();
@@ -90,7 +116,14 @@ export class AgentClient {
       this.#touch();
       for (const result of decoder.push(chunk)) {
         if (!result.ok) continue; // Ignore lines we do not understand; the hub is authoritative.
-        this.#handle(socket, result.message as HubToAgentMessage);
+        if (this.#socket !== socket) return;
+        try {
+          this.#handle(socket, result.message as HubToAgentMessage);
+        } catch {
+          // Never let a handler error escape: pi would treat it as fatal. Reconnect instead.
+          socket.destroy();
+          return;
+        }
       }
     });
     socket.on("error", () => {
@@ -108,6 +141,8 @@ export class AgentClient {
 
   /** Send now if possible, and re-send after every reconnect until the hub acks `message.id`. */
   sendReliable(message: AgentOutgoing & { id: string }): void {
+    // A message that cannot be framed would fail again after every reconnect: refuse it now.
+    encodeMessage({ v: PROTOCOL_VERSION, agentId: this.#o.agentId, ...message } as AgentToHubMessage);
     this.#reliable.set(message.id, message);
     this.send(message);
   }
@@ -128,6 +163,8 @@ export class AgentClient {
   }
 
   #handle(socket: net.Socket, message: HubToAgentMessage): void {
+    // Before a verified welcome the peer may not be our hub: only welcome and reject count.
+    if (!this.#ready && message.type !== "welcome" && message.type !== "reject") return;
     switch (message.type) {
       case "ping":
         this.#write(socket, message.id === undefined ? { type: "pong" } : { type: "pong", id: message.id });
@@ -135,10 +172,19 @@ export class AgentClient {
       case "pong":
         return;
       case "reject":
+        if (!this.#verified(message.hubSecret)) {
+          // Not provably our hub (or a hub that does not know us): retry like after a drop.
+          socket.destroy();
+          return;
+        }
         this.#o.onHubGone(`rejected by the hub: ${message.reason}`);
         this.close();
         return;
       case "welcome":
+        if (!this.#verified(message.hubSecret)) {
+          socket.destroy();
+          return;
+        }
         this.#ready = true;
         this.#welcomed = true;
         this.#attempt = 0;
@@ -157,9 +203,22 @@ export class AgentClient {
     }
   }
 
+  #verified(secret: string | undefined): boolean {
+    if (typeof secret !== "string") return false;
+    const a = Buffer.from(secret);
+    const b = Buffer.from(this.#o.hubSecret);
+    return a.length === b.length && timingSafeEqual(a, b);
+  }
+
   #write(socket: net.Socket, message: AgentOutgoing): void {
     if (socket.destroyed) return;
-    socket.write(encodeMessage({ v: PROTOCOL_VERSION, agentId: this.#o.agentId, ...message } as AgentToHubMessage));
+    let line: string;
+    try {
+      line = encodeMessage({ v: PROTOCOL_VERSION, agentId: this.#o.agentId, ...message } as AgentToHubMessage);
+    } catch {
+      return; // Too long to frame (callers cap their texts); never throw into a pi handler.
+    }
+    socket.write(line);
   }
 
   #touch(): void {

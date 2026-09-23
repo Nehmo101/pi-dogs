@@ -6,8 +6,13 @@ Thanks for your interest! The project is pre-alpha, so expect things to move.
 
 - Node.js 24 or newer. Source files are TypeScript and run directly through
   Node's type stripping; there is no build step.
-- `npm install` installs development tools only. pi-dogs has no runtime
-  dependencies, and we would like to keep it that way.
+- `npm install` installs the development tools and the one runtime
+  dependency, [koffi](https://koffi.dev) (FFI for the Win32 calls of the
+  Windows Terminal backend: window discovery, tiling, focus). Please do not
+  add further runtime dependencies without discussing it first. The pi
+  packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`,
+  `typebox`) are provided by pi at runtime; `npm run typecheck` links them
+  from the global pi installation.
 
 ## Before opening a pull request
 

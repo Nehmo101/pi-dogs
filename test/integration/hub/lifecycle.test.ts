@@ -21,7 +21,7 @@ describe("hub lifecycle", () => {
     await h?.cleanup();
     h = undefined;
   });
-  const agent = (file: string, options?: ConstructorParameters<typeof SimAgent>[1]) => {
+  const agent = (file: ConstructorParameters<typeof SimAgent>[0], options?: ConstructorParameters<typeof SimAgent>[1]) => {
     const a = new SimAgent(file, options);
     agents.push(a);
     return a.connect();
@@ -89,10 +89,27 @@ describe("hub lifecycle", () => {
   it("rejects a hello with a wrong token", async () => {
     h = await createHarness();
     await h.spawn();
-    const a = agent(h.lastLaunchFile(), { token: "wrong" });
-    await waitFor(() => a.hubGone !== undefined, 2000, "reject");
-    assert.match(a.hubGone!, /invalid token/);
+    const a = agent(h.lastLaunchFile(), { token: "wrong", backoffMs: [20] });
+    await new Promise((r) => setTimeout(r, 300));
+    // The reject carries no hub secret (the hub cannot know whom it talks to), so the
+    // dog cannot tell it from an impostor's and keeps retrying until its grace period.
+    assert.equal(a.hubGone, undefined);
+    assert.equal(a.client.ready, false);
     assert.equal(h.hub.registry.all()[0]!.state, "starting");
+  });
+
+  it("honours an authenticated reject (the dog is already finished)", async () => {
+    h = await createHarness();
+    const dog = await h.spawn();
+    const a = agent(h.lastLaunchFile());
+    await a.next("task");
+    a.close();
+    await waitFor(() => !dog.connected, 2000, "disconnect");
+    h.hub.windowClosed(dog.agentId);
+    await waitFor(() => dog.state === "killed", 3000, "killed");
+    const again = agent(a.launch, { backoffMs: [20] });
+    await waitFor(() => again.hubGone !== undefined, 2000, "reject");
+    assert.match(again.hubGone!, /already killed/);
   });
 
   it("steers a running dog and refuses to steer a closing one", async () => {

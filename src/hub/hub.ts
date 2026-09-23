@@ -11,8 +11,9 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import type { PaneBackend, PaneRef } from "../backend/pane-backend.ts";
-import { describeExit, readExitFile, writeLaunchFile, AGENT_ENV_VAR, type ExitFile } from "../protocol/launch.ts";
+import type { PaneBackend } from "../backend/pane-backend.ts";
+import { encodedTextBytes, MAX_TEXT_BYTES } from "../protocol/framing.ts";
+import { describeExit, readExitFile, writeLaunchFile, AGENT_ENV_VAR, WINDOW_CLOSED_EXIT_CODE, type ExitFile } from "../protocol/launch.ts";
 import type { AgentConfig, AgentMode, AgentToHubMessage, HelloMessage, Usage } from "../protocol/types.ts";
 import { PROTOCOL_VERSION } from "../protocol/version.ts";
 import type { PiDogsConfig } from "./config.ts";
@@ -27,6 +28,8 @@ import { defaultSessionFile, seedSessionFile, type SeedEntry } from "./session-s
 import { Connection, PipeServer } from "./server.ts";
 
 const RUN_DIR_CLEANUP_MS = 10_000;
+/** Finished dogs kept in the registry (and in /reload snapshots). */
+const KEEP_FINISHED = 20;
 
 export const RESULT_MESSAGE_TYPE = "pi-dogs-result";
 export const INFO_MESSAGE_TYPE = "pi-dogs-info";
@@ -66,6 +69,11 @@ export interface HubOptions {
   exitFileGraceMs?: number;
   pingIntervalMs?: number;
   idleTimeoutMs?: number;
+  /**
+   * How long a dog whose pipe dropped may stay away while its PID still
+   * looks alive. Caps the wait when the PID was reused by another process.
+   */
+  reconnectTimeoutMs?: number;
 }
 
 export interface SpawnRequest {
@@ -84,7 +92,10 @@ export interface SpawnRequest {
   parentSession?: string | undefined;
   /** Where to create the dog's session file. */
   sessionDir: string;
-  /** Pass `--approve` (the main pi trusts this project). */
+  /**
+   * Project trust for the dog's pi: true passes `--approve`, false
+   * `--no-approve`, undefined lets pi decide (it then may prompt).
+   */
   approve?: boolean | undefined;
 }
 
@@ -103,12 +114,19 @@ export class Hub {
   readonly #timers = new Map<string, NodeJS.Timeout>();
   readonly #watches = new Map<string, NodeJS.Timeout>();
   readonly #finalWaiters = new Map<string, Array<() => void>>();
-  /** How to report a dog that is being killed, once it is gone. */
-  readonly #killReports = new Map<string, { report: boolean; triggerTurn: boolean }>();
   /** Session-scoped settings (set with /dogs model or subagent_config). */
   sessionDefaultModel: string | undefined;
   readonly sessionRoles: Record<string, string> = {};
+  /**
+   * Bumped by the runtime on /new and /resume of the main pi. Results of dogs
+   * started in an earlier epoch belong to another conversation: they are
+   * delivered without triggering a turn.
+   */
+  sessionEpoch = 0;
+  /** No new dogs (shutting down). */
   #stopped = false;
+  /** Handed over to the next runtime (or quit finished): ignore late events. */
+  #detached = false;
 
   constructor(options: HubOptions) {
     this.#o = {
@@ -119,6 +137,7 @@ export class Hub {
       exitFileGraceMs: 1500,
       pingIntervalMs: 5_000,
       idleTimeoutMs: 15_000,
+      reconnectTimeoutMs: 60_000,
       ...options,
     } as Required<Omit<HubOptions, "registry">>;
     this.registry = options.registry ?? new Registry({ mirrorLimit: options.config.mirrorLines });
@@ -132,12 +151,19 @@ export class Hub {
       onError: (err) => this.#o.host.notify(`pi-dogs pipe error: ${err.message}`, "error"),
     });
     this.#o.backend.setEvents({
-      onClosed: (ref) => this.#onWindowClosed(ref),
+      onClosed: (ref) => this.windowClosed(ref.agentId),
       onMinimizedChange: (ref, minimized) => {
+        if (this.#detached) return;
         const dog = this.registry.get(ref.agentId);
         if (!dog || dog.minimized === minimized) return;
         this.registry.update(dog.agentId, { minimized });
         this.#o.host.changed();
+      },
+      onFocusNotReturned: (ref) => {
+        if (this.#detached) return;
+        const dog = this.registry.get(ref.agentId);
+        if (!dog) return;
+        this.#o.host.notify(`Windows kept the focus on ${dog.name}'s window: keystrokes now go there. Click this window to continue here.`, "warning");
       },
     });
   }
@@ -161,7 +187,11 @@ export class Hub {
     const now = this.#o.now();
     for (const dog of this.registry.live()) {
       if (dog.state === "starting") this.#armHelloTimer(dog, Math.max(0, dog.startedAt + this.#o.config.helloTimeoutMs - now));
-      else this.#watchExit(dog.agentId);
+      else this.#watchExit(dog.agentId, dog.windowClosed === true);
+      // A kill that was in flight when the previous runtime stopped: carry it through.
+      if (dog.state === "closing" && dog.closingTarget === "killed") {
+        void this.kill(dog, dog.closingReason ?? "stopped").catch((err: Error) => debugLog(`resumed kill ${dog.agentId} failed: ${err.message}`));
+      }
     }
   }
 
@@ -176,6 +206,13 @@ export class Hub {
     }
     const availability = this.#o.backend.available();
     if (!availability.ok) throw new HubError(availability.hint);
+    const taskBytes = encodedTextBytes(req.task);
+    if (taskBytes > MAX_TEXT_BYTES) {
+      throw new HubError(
+        `The task is too long (${Math.ceil(taskBytes / 1024)} KiB, limit ${MAX_TEXT_BYTES / 1024} KiB). ` +
+          "Put large material into a file and name the file in the task, or pass it as `context`.",
+      );
+    }
 
     const pool = config.dogNamesMode === "replace" && config.dogNames.length ? config.dogNames : [...DOG_NAMES, ...config.dogNames];
     const name = pickDogName(this.registry.names(), req.name === undefined ? { pool } : { pool, preferred: req.name });
@@ -205,6 +242,7 @@ export class Hub {
       agentId,
       name,
       token: randomBytes(24).toString("base64url"),
+      hubSecret: randomBytes(24).toString("base64url"),
       color,
       model: req.model ?? "default",
       ...(req.thinking ? { thinking: req.thinking } : {}),
@@ -218,31 +256,32 @@ export class Hub {
       launchFile,
       exitFile,
       startedAt: now,
-    });
-
-    const piArgs = buildPiArgs({
-      agentExtension: this.#o.agentExtension,
-      launchFile,
-      sessionFile,
-      model: req.model,
-      thinking: req.thinking,
-      tools: req.tools,
-      name,
-      approve: req.approve === true,
-    });
-    writeLaunchFile(launchFile, {
-      v: PROTOCOL_VERSION,
-      agentId,
-      name,
-      pipe: this.pipe,
-      token: record.token,
-      cwd: req.cwd,
-      exitFile,
-      pi: { command: this.#o.piCommand.command, args: [...this.#o.piCommand.args, ...piArgs] },
-      env: { ...forwardedEnv(), [AGENT_ENV_VAR]: agentId },
+      sessionEpoch: this.sessionEpoch,
     });
 
     try {
+      const piArgs = buildPiArgs({
+        agentExtension: this.#o.agentExtension,
+        launchFile,
+        sessionFile,
+        model: req.model,
+        thinking: req.thinking,
+        tools: req.tools,
+        name,
+        approve: req.approve,
+      });
+      writeLaunchFile(launchFile, {
+        v: PROTOCOL_VERSION,
+        agentId,
+        name,
+        pipe: this.pipe,
+        token: record.token,
+        hubSecret: record.hubSecret,
+        cwd: req.cwd,
+        exitFile,
+        pi: { command: this.#o.piCommand.command, args: [...this.#o.piCommand.args, ...piArgs] },
+        env: { ...forwardedEnv(), [AGENT_ENV_VAR]: agentId },
+      });
       await this.#o.backend.open({
         agentId,
         name,
@@ -253,8 +292,9 @@ export class Hub {
         args: [this.#o.launcher, launchFile],
       });
     } catch (err) {
-      this.#finalize(agentId, { state: "failed", reason: `could not open a window: ${(err as Error).message}` }, { report: false });
-      throw new HubError(`Could not open a window for ${name}: ${(err as Error).message}`);
+      // Whatever failed after the record was added (launch file, window), never leave it "starting".
+      this.#finalize(agentId, { state: "failed", reason: `could not start: ${(err as Error).message}` }, { report: false });
+      throw new HubError(`Could not start ${name}: ${(err as Error).message}`);
     }
     debugLog(`spawned ${agentId} "${name}" model=${record.model} backend=${this.#o.backend.name} cwd=${req.cwd}`);
     this.#armHelloTimer(record, config.helloTimeoutMs);
@@ -278,11 +318,13 @@ export class Hub {
 
   // ------------------------------------------------------------------ pipe
 
-  #onHello(conn: Connection, hello: HelloMessage): true | { reject: string } {
+  #onHello(conn: Connection, hello: HelloMessage): true | { reject: string; hubSecret?: string } {
+    if (this.#detached) return { reject: "hub is shutting down" };
     const dog = this.registry.get(hello.agentId);
     if (!dog || !tokensEqual(dog.token, hello.token)) return { reject: "unknown agent or invalid token" };
-    if (hello.protocol < PROTOCOL_VERSION) return { reject: `protocol ${hello.protocol} is not supported` };
-    if (isTerminal(dog.state) && dog.state !== "done") return { reject: `agent already ${dog.state}` };
+    // Authenticated: the reject carries the hub secret, so the dog knows it is final.
+    if (hello.protocol < PROTOCOL_VERSION) return { reject: `protocol ${hello.protocol} is not supported`, hubSecret: dog.hubSecret };
+    if (isTerminal(dog.state) && dog.state !== "done") return { reject: `agent already ${dog.state}`, hubSecret: dog.hubSecret };
 
     const previous = this.#conns.get(dog.agentId);
     this.#conns.set(dog.agentId, conn);
@@ -300,8 +342,11 @@ export class Hub {
       name: dog.name,
     };
     const resumed = dog.taskSent;
-    conn.send({ type: "welcome", config: agentConfig, resumed }, dog.agentId);
-    if (!dog.taskSent) {
+    conn.send({ type: "welcome", config: agentConfig, resumed, hubSecret: dog.hubSecret }, dog.agentId);
+    if (dog.state === "closing" && dog.closingTarget === "killed") {
+      // Reconnected while being killed (e.g. the shutdown was lost with the old pipe): repeat it.
+      conn.send({ type: "shutdown" }, dog.agentId);
+    } else if (!dog.taskSent) {
       conn.send({ type: "task", text: dog.task }, dog.agentId);
       this.registry.update(dog.agentId, { taskSent: true });
       this.registry.tryTransition(dog.agentId, "running", now);
@@ -313,7 +358,7 @@ export class Hub {
 
   #onMessage(conn: Connection, msg: AgentToHubMessage): void {
     const dog = this.registry.get(msg.agentId);
-    if (!dog || this.#conns.get(msg.agentId) !== conn) return;
+    if (this.#detached || !dog || this.#conns.get(msg.agentId) !== conn) return;
     const now = this.#o.now();
     switch (msg.type) {
       case "status": {
@@ -368,6 +413,12 @@ export class Hub {
     debugLog(`done ${dog.agentId}${error ? ` error=${error}` : ""}`);
     const now = this.#o.now();
     this.registry.update(dog.agentId, { usage, summary, sessionFile: sessionFile || dog.sessionFile });
+    if (dog.state === "closing" && dog.closingTarget === "killed") {
+      // A result that crossed our shutdown (e.g. the aborted run settled): the kill wins.
+      // Keep the text for the kill report; how (and whether) to report is the kill's choice.
+      this.registry.update(dog.agentId, { outcome: { state: "killed", summary, ...(error ? { error } : {}) } });
+      return;
+    }
     const outcome: DogOutcome = { state: "done", summary, ...(error ? { error } : {}) };
     if (dog.closeOnDone) {
       this.registry.transition(dog.agentId, "closing", now);
@@ -392,7 +443,8 @@ export class Hub {
 
   #onClose(conn: Connection): void {
     const agentId = conn.agentId;
-    if (agentId === undefined || this.#conns.get(agentId) !== conn) return;
+    // After stop() our own server.close() drops every pipe: the next runtime takes over.
+    if (this.#detached || agentId === undefined || this.#conns.get(agentId) !== conn) return;
     this.#conns.delete(agentId);
     const dog = this.registry.get(agentId);
     if (!dog) return;
@@ -402,9 +454,17 @@ export class Hub {
     this.#o.host.changed();
   }
 
-  #onWindowClosed(ref: PaneRef): void {
-    const dog = this.registry.get(ref.agentId);
+  /**
+   * The backend saw the dog's window disappear. Public so the runtime can
+   * replay a close that happened while no hub was subscribed (/reload).
+   */
+  windowClosed(agentId: string): void {
+    if (this.#detached) return;
+    const dog = this.registry.get(agentId);
     if (!dog || isTerminal(dog.state)) return;
+    // An exit file with a real crash code written before the window went means pi ended on its own.
+    const early = readExitFile(dog.exitFile);
+    if (!early || !isCrash(early)) this.registry.update(agentId, { windowClosed: true });
     if (dog.state === "starting") {
       const exit = readExitFile(dog.exitFile);
       this.#finalize(dog.agentId, { state: "failed", reason: exit ? describeExit(exit) : "window closed before the agent connected" }, { report: true, triggerTurn: true, closeWindow: false });
@@ -418,11 +478,13 @@ export class Hub {
    * launcher's exit file, or the pi process disappearing, whichever is first.
    */
   #watchExit(agentId: string, windowGone = false): void {
+    if (this.#detached) return;
     this.#clearWatch(agentId);
     let goneSince: number | undefined;
+    const since = this.#o.now();
     const tick = () => {
       const dog = this.registry.get(agentId);
-      if (!dog || isTerminal(dog.state) || dog.connected) return this.#clearWatch(agentId);
+      if (this.#detached || !dog || isTerminal(dog.state) || dog.connected) return this.#clearWatch(agentId);
       const now = this.#o.now();
       const exit = readExitFile(dog.exitFile);
       const alive = dog.pid !== undefined && !windowGone ? this.#o.isAlive(dog.pid) : false;
@@ -432,6 +494,11 @@ export class Hub {
           this.#finalize(agentId, this.#exitOutcome(dog, exit, windowGone), { report: true, triggerTurn: true });
           return;
         }
+      } else if (now - since >= this.#o.reconnectTimeoutMs) {
+        // "Alive" for this long without a reconnect: most likely the PID now belongs to another process.
+        const secs = Math.round(this.#o.reconnectTimeoutMs / 1000);
+        this.#finalize(agentId, { state: "failed", reason: `lost the connection and did not reconnect within ${secs} s` }, { report: true, triggerTurn: true });
+        return;
       }
       this.#watches.set(agentId, setTimeout(tick, this.#o.pollMs));
     };
@@ -443,7 +510,9 @@ export class Hub {
       const target = dog.closingTarget ?? "killed";
       return { state: target, ...(dog.closingReason ? { reason: dog.closingReason } : {}), ...(dog.outcome?.summary ? { summary: dog.outcome.summary } : {}) };
     }
-    if (exit && (exit.code !== 0 || exit.error || exit.signal)) return { state: "failed", reason: `pi crashed (${describeExit(exit)})` };
+    // Closing the window ends pi too; whatever exit that produced, it was the user's doing.
+    if (dog.windowClosed || exit?.code === WINDOW_CLOSED_EXIT_CODE) return { state: "killed", reason: "window closed" };
+    if (exit && isCrash(exit)) return { state: "failed", reason: `pi crashed (${describeExit(exit)})` };
     if (exit) return { state: "failed", reason: "pi exited without reporting a result" };
     return { state: "killed", reason: windowGone ? "window closed" : "window closed or process ended" };
   }
@@ -452,6 +521,10 @@ export class Hub {
 
   steer(dog: DogRecord, text: string, mode: "steer" | "followUp" = "steer"): Result {
     if (!text.trim()) return { ok: false, error: "Empty message." };
+    const bytes = encodedTextBytes(text);
+    if (bytes > MAX_TEXT_BYTES) {
+      return { ok: false, error: `Message too long (${Math.ceil(bytes / 1024)} KiB, limit ${MAX_TEXT_BYTES / 1024} KiB). Put large material into a file and name the file.` };
+    }
     if (dog.state === "closing" || isTerminal(dog.state)) return { ok: false, error: `${dog.name} is ${dog.state} and accepts no more messages.` };
     const conn = this.#conns.get(dog.agentId);
     if (!conn || !dog.connected) return { ok: false, error: `${dog.name} is not connected right now (starting or reconnecting); try again shortly.` };
@@ -471,6 +544,7 @@ export class Hub {
    * `graceMs`. Resolves once the dog is in a terminal state.
    */
   async kill(dog: DogRecord, reason: string, options: { report?: boolean; triggerTurn?: boolean; graceMs?: number } = {}): Promise<void> {
+    if (this.#detached) return;
     const graceMs = options.graceMs ?? this.#o.config.killGraceMs;
     const conn = this.#conns.get(dog.agentId);
     if (isTerminal(dog.state)) {
@@ -487,12 +561,21 @@ export class Hub {
       this.registry.transition(dog.agentId, "closing", this.#o.now());
       this.registry.update(dog.agentId, { closingTarget: "killed", closingReason: reason });
     }
-    this.#killReports.set(dog.agentId, { report: options.report ?? true, triggerTurn: options.triggerTurn ?? false });
+    if (dog.closingTarget === "killed") {
+      // On the record, not in a map: a /reload snapshot must carry how to report the kill.
+      this.registry.update(dog.agentId, {
+        closingReport: options.report ?? dog.closingReport ?? true,
+        closingTriggerTurn: options.triggerTurn ?? dog.closingTriggerTurn ?? false,
+      });
+    }
     this.#o.host.changed();
     conn?.send({ type: "shutdown" });
     if (await withTimeout(final, graceMs)) return;
+    // The runtime was replaced while we waited: the next hub resumes this kill.
+    if (this.#detached) return;
     if (dog.pid !== undefined) await this.#o.killTree(dog.pid);
     if (await withTimeout(final, this.#o.exitFileGraceMs + this.#o.pollMs * 2)) return;
+    if (this.#detached) return;
     this.#finalize(dog.agentId, { state: dog.closingTarget ?? "killed", reason });
   }
 
@@ -529,9 +612,20 @@ export class Hub {
     if (this.#stopped) return;
     this.#stopped = true;
     if (reason === "quit" && this.#o.config.killChildrenOnExit) {
-      const live = this.registry.live();
-      await Promise.all(live.map((dog) => this.kill(dog, "main pi quit", { report: false, graceMs: this.#o.config.quitGraceMs })));
+      // Live dogs, plus finished ones still connected (closeOnDone=false keeps their pi open).
+      // kill() only sends those a shutdown; their pi then exits and its window closes.
+      const dogs = this.registry.all().filter((dog) => !isTerminal(dog.state) || this.#conns.has(dog.agentId));
+      const finished = dogs.filter((dog) => isTerminal(dog.state));
+      await Promise.all(dogs.map((dog) => this.kill(dog, "main pi quit", { report: false, triggerTurn: false, graceMs: this.#o.config.quitGraceMs })));
+      // Let their shutdown reach them before the server drops every pipe.
+      const open = finished.map((dog) => this.#conns.get(dog.agentId)).filter((c): c is Connection => c !== undefined);
+      for (const conn of open) conn.close("main pi quit");
+      const deadline = Date.now() + this.#o.config.quitGraceMs;
+      while (open.some((c) => !c.closed) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
     }
+    this.#detached = true;
+    // Pending kill() calls of this runtime return now; the next runtime resumes them.
+    for (const agentId of [...this.#finalWaiters.keys()]) this.#resolveFinal(agentId);
     for (const t of this.#timers.values()) clearTimeout(t);
     for (const t of this.#watches.values()) clearTimeout(t);
     this.#timers.clear();
@@ -544,14 +638,14 @@ export class Hub {
 
   #finalize(agentId: string, outcome: DogOutcome, options: { report?: boolean; triggerTurn?: boolean; closeWindow?: boolean } = {}): void {
     const dog = this.registry.get(agentId);
-    if (!dog || isTerminal(dog.state)) return;
+    if (this.#detached || !dog || isTerminal(dog.state)) return;
     this.#clearTimer(agentId);
     this.#clearWatch(agentId);
     const merged: DogOutcome = { ...dog.outcome, ...outcome };
     debugLog(`finalize ${agentId} -> ${outcome.state}${outcome.reason ? ` (${outcome.reason})` : ""}`);
-    const killReport = this.#killReports.get(agentId);
-    this.#killReports.delete(agentId);
-    if (killReport && outcome.state === "killed") options = { ...options, report: killReport.report, triggerTurn: killReport.triggerTurn };
+    if (outcome.state === "killed" && dog.closingTarget === "killed" && dog.closingReport !== undefined) {
+      options = { ...options, report: dog.closingReport, triggerTurn: dog.closingTriggerTurn ?? false };
+    }
     this.registry.transition(agentId, outcome.state, this.#o.now());
     this.registry.update(agentId, { outcome: merged });
     this.#conns.get(agentId)?.close("finished");
@@ -566,6 +660,7 @@ export class Hub {
     }
     void this.#o.backend.relayout().catch(() => undefined);
     this.#resolveFinal(agentId);
+    this.registry.pruneTerminal(KEEP_FINISHED);
     this.#o.host.changed();
   }
 
@@ -582,10 +677,14 @@ export class Hub {
       ...(outcome.error ? { error: outcome.error } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
     };
-    this.#o.host.sendToMain(
-      { customType: RESULT_MESSAGE_TYPE, content: buildResultText({ ...details, summary: outcome.summary }), details },
-      { triggerTurn },
-    );
+    let content = buildResultText({ ...details, summary: outcome.summary });
+    if ((dog.sessionEpoch ?? 0) !== this.sessionEpoch) {
+      // Started before /new or /resume: this conversation did not ask for it.
+      const [head = "", ...rest] = content.split("\n");
+      content = [head, "(Started in an earlier session of the main pi; shown for reference only.)", ...rest].join("\n");
+      triggerTurn = false;
+    }
+    this.#o.host.sendToMain({ customType: RESULT_MESSAGE_TYPE, content, details }, { triggerTurn });
   }
 
   #waitFinal(agentId: string): Promise<void> {
@@ -634,6 +733,12 @@ function forwardedEnv(env: NodeJS.ProcessEnv = process.env): Record<string, stri
     if (value !== undefined) out[name] = value;
   }
   return out;
+}
+
+/** An exit that looks like pi failing on its own (not a clean exit, not a closed window). */
+function isCrash(exit: ExitFile): boolean {
+  if (exit.code === WINDOW_CLOSED_EXIT_CODE) return false;
+  return exit.code !== 0 || exit.error !== undefined || exit.signal !== null;
 }
 
 function tokensEqual(a: string, b: string): boolean {

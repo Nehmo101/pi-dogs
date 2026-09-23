@@ -125,7 +125,7 @@ async function handle(args: string, ctx: ExtensionCommandContext, runtime: HubRu
         cwd: ctx.cwd,
         sessionDir: runtime.sessionDirFor(ctx),
         parentSession: ctx.sessionManager.getSessionFile(),
-        approve: ctx.isProjectTrusted(),
+        approve: runtime.dogTrust(ctx, ctx.cwd),
       });
       ctx.ui.notify(`Started ${dog.name} (${dog.model}).`, "info");
       return;

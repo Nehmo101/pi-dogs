@@ -11,6 +11,7 @@ import net from "node:net";
 import { encodeMessage, JsonlDecoder } from "../protocol/framing.ts";
 import type { AgentToHubMessage, HelloMessage, HubToAgentMessage } from "../protocol/types.ts";
 import { PROTOCOL_VERSION } from "../protocol/version.ts";
+import { debugLog } from "./log.ts";
 
 /** Hub-to-agent message without the envelope fields the connection fills in. */
 export type Outgoing = DistributiveOmit<HubToAgentMessage, "v" | "agentId">;
@@ -19,7 +20,7 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 export interface ServerOptions {
   pipe: string;
   /** Decide on a `hello`; return a reason string to reject it. */
-  onHello(conn: Connection, hello: HelloMessage): true | { reject: string };
+  onHello(conn: Connection, hello: HelloMessage): true | { reject: string; hubSecret?: string };
   onMessage(conn: Connection, message: AgentToHubMessage): void;
   /** An authenticated connection closed (for any reason). */
   onClose(conn: Connection, reason: string): void;
@@ -54,7 +55,15 @@ export class Connection {
   send(message: Outgoing, agentId = this.agentId ?? "?"): boolean {
     if (this.#closed || this.#socket.destroyed) return false;
     const full = { v: PROTOCOL_VERSION, agentId, ...message } as HubToAgentMessage;
-    this.#socket.write(encodeMessage(full));
+    let line: string;
+    try {
+      line = encodeMessage(full);
+    } catch (err) {
+      // Too long to frame: never let it throw into a pipe handler (it would end the main pi).
+      debugLog(`not sent to ${agentId}: ${(err as Error).message}`);
+      return false;
+    }
+    this.#socket.write(line);
     return true;
   }
 
@@ -152,39 +161,14 @@ export class PipeServer {
     helloTimer.unref();
 
     socket.on("data", (chunk) => {
-      conn.lastSeen = Date.now();
-      for (const result of decoder.push(chunk)) {
-        if (!result.ok) {
-          // A peer that speaks garbage is either broken or not ours.
-          conn.destroy(`protocol error: ${result.error.message}`);
-          return;
-        }
-        const message = result.message as AgentToHubMessage;
-        if (conn.agentId === undefined) {
-          if (message.type !== "hello") {
-            conn.destroy(`expected hello, got ${message.type}`);
-            return;
-          }
-          const verdict = this.#options.onHello(conn, message);
-          if (verdict === true) {
-            conn.agentId = message.agentId;
-            clearTimeout(helloTimer);
-          } else {
-            conn.send({ type: "reject", reason: verdict.reject }, message.agentId);
-            conn.close(`rejected: ${verdict.reject}`);
-          }
-          continue;
-        }
-        if (message.agentId !== conn.agentId) {
-          conn.destroy("agentId mismatch");
-          return;
-        }
-        if (message.type === "ping") {
-          conn.send(message.id === undefined ? { type: "pong" } : { type: "pong", id: message.id });
-          continue;
-        }
-        if (message.type === "pong") continue;
-        this.#options.onMessage(conn, message);
+      // An exception escaping a socket handler reaches pi's uncaughtException
+      // handler, which ends the main pi. Contain it to this connection.
+      try {
+        this.#onData(conn, decoder, chunk, helloTimer);
+      } catch (err) {
+        debugLog(`pipe handler failed for ${conn.agentId ?? "?"}: ${(err as Error).stack ?? String(err)}`);
+        this.#options.onError?.(new Error(`internal error while handling a message: ${(err as Error).message}`));
+        conn.destroy(`internal error: ${(err as Error).message}`);
       }
     });
     socket.on("error", () => {
@@ -194,8 +178,50 @@ export class PipeServer {
       clearTimeout(helloTimer);
       conn.markClosed();
       this.#connections.delete(conn);
-      if (conn.agentId !== undefined) this.#options.onClose(conn, conn.closeReason);
+      if (conn.agentId === undefined) return;
+      try {
+        this.#options.onClose(conn, conn.closeReason);
+      } catch (err) {
+        debugLog(`close handler failed for ${conn.agentId}: ${(err as Error).stack ?? String(err)}`);
+      }
     });
+  }
+
+  #onData(conn: Connection, decoder: JsonlDecoder, chunk: Buffer, helloTimer: NodeJS.Timeout): void {
+    conn.lastSeen = Date.now();
+    for (const result of decoder.push(chunk)) {
+      if (!result.ok) {
+        // A peer that speaks garbage is either broken or not ours.
+        conn.destroy(`protocol error: ${result.error.message}`);
+        return;
+      }
+      const message = result.message as AgentToHubMessage;
+      if (conn.agentId === undefined) {
+        if (message.type !== "hello") {
+          conn.destroy(`expected hello, got ${message.type}`);
+          return;
+        }
+        const verdict = this.#options.onHello(conn, message);
+        if (verdict === true) {
+          conn.agentId = message.agentId;
+          clearTimeout(helloTimer);
+        } else {
+          conn.send({ type: "reject", reason: verdict.reject, ...(verdict.hubSecret ? { hubSecret: verdict.hubSecret } : {}) }, message.agentId);
+          conn.close(`rejected: ${verdict.reject}`);
+        }
+        continue;
+      }
+      if (message.agentId !== conn.agentId) {
+        conn.destroy("agentId mismatch");
+        return;
+      }
+      if (message.type === "ping") {
+        conn.send(message.id === undefined ? { type: "pong" } : { type: "pong", id: message.id });
+        continue;
+      }
+      if (message.type === "pong") continue;
+      this.#options.onMessage(conn, message);
+    }
   }
 
   #keepAlive(): void {

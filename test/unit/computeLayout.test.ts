@@ -7,6 +7,8 @@ import {
   DEFAULT_LAYOUT_PREFS,
   layoutPrefsForScale,
   minimumSizes,
+  RELAXED_MIN_COLS,
+  relaxPrefs,
   type Arrangement,
   type Layout,
   type LayoutAgent,
@@ -18,12 +20,14 @@ import { renderLayout } from "../helpers/ascii.ts";
 
 // Physical work areas (monitor minus a 48 px taskbar) at common resolutions.
 const WORK_AREAS: Rect[] = [
+  { x: 0, y: 0, width: 1366, height: 728 },
   { x: 0, y: 0, width: 1920, height: 1032 },
   { x: 0, y: 0, width: 2560, height: 1392 },
+  { x: 0, y: 0, width: 2880, height: 1752 },
   { x: 0, y: 0, width: 3440, height: 1392 },
   { x: 0, y: 0, width: 3840, height: 2112 },
 ];
-const SCALES = [1, 1.25, 1.5];
+const SCALES = [1, 1.25, 1.5, 2];
 const ARRANGEMENTS: Arrangement[] = ["columns", "stacked"];
 
 const agentsOf = (n: number): LayoutAgent[] => Array.from({ length: n }, (_, i) => ({ id: `a${i}` }));
@@ -129,7 +133,8 @@ function assertValidLayout(
   );
 
   // Main window: left, full height, minimum width and preferred share.
-  const min = minimumSizes(prefs);
+  // The minimums actually used (relaxed on small or highly scaled screens).
+  const min = minimumSizes(relaxPrefs(work, true, prefs));
   assert.equal(layout.main.x, work.x);
   assert.equal(layout.main.y, work.y);
   assert.equal(layout.main.height, work.height);
@@ -149,7 +154,8 @@ function assertValidLayout(
 
   // Minimum sizes everywhere, and a clean grid on each secondary area.
   secondary.forEach((s, i) => {
-    const smin = minimumSizes({ ...prefs, ...(s.cellSize && { cellSize: s.cellSize }), ...(s.chrome && { chrome: s.chrome }) });
+    const sp = { ...prefs, ...(s.cellSize && { cellSize: s.cellSize }), ...(s.chrome && { chrome: s.chrome }) };
+    const smin = minimumSizes(relaxPrefs(s.rect, false, sp));
     const here = rects(layout).filter((r) => inside(r, s.rect));
     for (const r of here) assert.ok(r.width >= smin.agent.w && r.height >= smin.agent.h, `${label}: secondary ${i} min size`);
     if (here.length > 0) assertGrid(here, s.rect, prefs, `${label} secondary ${i}`);
@@ -225,9 +231,9 @@ describe("computeLayout rules", () => {
       assert.deepEqual(layout.minimized, ["a1"]);
     });
 
-    it(`${arrangement}: minimizes everything when not even one agent fits`, () => {
-      // 1920 px at 150 %: 100 + 80 columns of 14 px do not fit side by side.
-      const work = area(1920, 1032);
+    it(`${arrangement}: minimizes everything when not even two ${RELAXED_MIN_COLS}-column windows fit`, () => {
+      // 1200 px at 150 %: half the width holds only 39 columns of 14 px.
+      const work = area(1200, 1032);
       const layout = computeLayout(work, agentsOf(2), layoutPrefsForScale(1.5, { arrangement }));
       assert.deepEqual(layout, { main: work, agents: [], minimized: ["a0", "a1"] });
     });
@@ -365,6 +371,50 @@ describe("computeLayout rules", () => {
   });
 });
 
+describe("computeLayout on small or highly scaled screens (relaxed minimums)", () => {
+  // Cells of the visible windows, as the backend would size them.
+  const cells = (r: Rect, p: LayoutPrefs) => ({
+    cols: Math.floor((r.width - p.chrome.w) / p.cellSize.w),
+    rows: Math.floor((r.height - p.chrome.h) / p.cellSize.h),
+  });
+  const cases: { work: Rect; scale: number; shown: number[]; mainWidth: number }[] = [
+    // shown[n - 1] = visible agents with n agents open
+    { work: area(1920, 1032), scale: 1.25, shown: [1, 2, 2], mainWidth: 960 },
+    { work: area(1920, 1032), scale: 1.5, shown: [1, 1, 1], mainWidth: 960 },
+    { work: area(1366, 728), scale: 1, shown: [1, 2, 2], mainWidth: 683 },
+    { work: area(2880, 1752), scale: 2, shown: [1, 2, 2], mainWidth: 1440 },
+  ];
+  for (const { work, scale, shown, mainWidth } of cases) {
+    it(`shows agents on ${work.width}x${work.height} @${scale * 100}% instead of minimizing them all`, () => {
+      const prefs = layoutPrefsForScale(scale);
+      for (let n = 1; n <= shown.length; n++) {
+        const layout = computeLayout(work, agentsOf(n), prefs);
+        assertValidLayout(work, agentsOf(n), prefs, layout);
+        assert.equal(layout.agents.length, shown[n - 1], `n=${n}: visible agents`);
+        assert.equal(layout.main.width, mainWidth, `n=${n}: main keeps half the width`);
+        assert.ok(cells(layout.main, prefs).cols >= RELAXED_MIN_COLS, `n=${n}: main readable`);
+        for (const a of layout.agents) {
+          const c = cells(a.rect, prefs);
+          assert.ok(c.cols >= RELAXED_MIN_COLS && c.rows >= prefs.agentMinRows, `n=${n}: ${a.id} is ${c.cols}x${c.rows}`);
+        }
+        assert.deepEqual(ids(layout), agentsOf(n).map((a) => a.id).slice(n - shown[n - 1]!), "newest shown");
+      }
+    });
+  }
+
+  it("relaxes step by step: first main down to agentMinCols, then a 50/50 split", () => {
+    const p125 = layoutPrefsForScale(1.25);
+    const step1 = relaxPrefs(area(1920, 1032), true, p125);
+    assert.equal(step1.mainMinCols, p125.agentMinCols);
+    assert.equal(step1.agentMinCols, p125.agentMinCols);
+    const step2 = relaxPrefs(area(1920, 1032), true, layoutPrefsForScale(1.5));
+    assert.deepEqual([step2.mainMinCols, step2.agentMinCols], [64, 64]);
+    // Nothing is relaxed where the normal rule already fits one agent.
+    const p100 = layoutPrefsForScale(1);
+    assert.equal(relaxPrefs(area(1920, 1032), true, p100), p100);
+  });
+});
+
 describe("computeLayout with secondary work areas (multi-monitor)", () => {
   const primary = area(1920, 1032);
   const rightMonitor: SecondaryWorkArea = { rect: area(1920, 1032, 1920) };
@@ -420,11 +470,14 @@ describe("computeLayout with secondary work areas (multi-monitor)", () => {
     }
   });
 
-  it("puts agents on a secondary area even when none fits next to main", () => {
+  it("puts the older agent on a secondary area when only a relaxed 50/50 fits next to main", () => {
     const layout = computeLayout(primary, agentsOf(2), layoutPrefsForScale(1.5), { secondaryWorkAreas: [rightMonitor] });
-    assert.deepEqual(layout.main, primary);
-    assert.deepEqual(ids(layout), ["a1"]);
-    assert.deepEqual(layout.minimized, ["a0"]);
+    assert.deepEqual(layout.main, area(960, 1032));
+    assert.deepEqual(layout.agents, [
+      { id: "a1", rect: area(960, 1032, 960) },
+      { id: "a0", rect: area(1920, 1032, 1920) },
+    ]);
+    assert.deepEqual(layout.minimized, []);
   });
 
   it("keeps all invariants across monitor combinations and agent counts", () => {

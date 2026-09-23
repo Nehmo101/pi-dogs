@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { computeLayout, type Rect } from "../../src/layout/computeLayout.ts";
 import { Tiler } from "../../src/backend/windows-terminal/tiler.ts";
 import { SW } from "../../src/backend/windows-terminal/win32.ts";
-import { FakeWin32 } from "../helpers/fake-win32.ts";
+import { FakeWin32, outerOf } from "../helpers/fake-win32.ts";
 
 const WORK: Rect = { x: 0, y: 0, width: 3440, height: 1392 };
 
@@ -256,15 +256,183 @@ describe("Tiler.poll", () => {
     assert.deepEqual(tiler.poll().minimizedChanges, []);
   });
 
-  it("asks for a relayout when the work area or DPI changes", async () => {
-    const { w, tiler } = setup(1);
+  it("asks for a relayout when the work area or DPI changes, once it is stable for 500 ms", async () => {
+    let clock = 0;
+    const { w, tiler } = setup(1, { now: () => clock });
     await tiler.apply();
     assert.equal(tiler.poll().relayout, false);
     w.monitors[0]!.work = { x: 0, y: 0, width: 3440, height: 1400 }; // taskbar auto-hidden
+    assert.equal(tiler.poll().relayout, false, "not yet: debounced");
+    clock += 499;
+    assert.equal(tiler.poll().relayout, false);
+    clock += 1;
     assert.equal(tiler.poll().relayout, true);
     assert.equal(tiler.poll().relayout, false);
     w.monitors[0]!.dpi = 120;
+    tiler.poll();
+    clock += 200;
+    w.monitors[0]!.dpi = 144; // changed again: the 500 ms start over
+    tiler.poll();
+    clock += 400;
+    assert.equal(tiler.poll().relayout, false);
+    clock += 100;
     assert.equal(tiler.poll().relayout, true);
+  });
+
+  it("does not re-tile while the user drags main (move/size loop or mouse button down)", async () => {
+    let clock = 0;
+    const { w, main, tiler } = setup(1, { now: () => clock });
+    await tiler.apply();
+    tiler.poll();
+    w.monitors[0]!.work = { x: 0, y: 0, width: 3440, height: 1400 };
+    tiler.poll();
+    w.inMoveSize.add(main.hwnd);
+    clock += 2000;
+    assert.equal(tiler.poll().relayout, false, "still dragging");
+    w.inMoveSize.clear();
+    w.mouseDown = true;
+    assert.equal(tiler.poll().relayout, false, "button still down");
+    w.mouseDown = false;
+    assert.equal(tiler.poll().relayout, true);
+  });
+
+  it("keeps close events when the monitor list is empty for a moment (RDP reconnect)", async () => {
+    const { w, tiler, agents } = setup(3);
+    await tiler.apply();
+    w.windows.get(agents[1]!.hwnd)!.iconic = true;
+    tiler.poll();
+    const saved = w.monitors;
+    w.monitors = [];
+    w.close(agents[0]!.hwnd);
+    w.windows.get(agents[1]!.hwnd)!.iconic = false; // restored by the user at the same time
+    const result = tiler.poll();
+    assert.deepEqual(result.closed, ["a0"]);
+    assert.deepEqual(result.minimizedChanges, [{ agentId: "a1", minimized: false, reason: "user" }]);
+    assert.equal(tiler.entries.at(-1)!.agentId, "a1", "restored one is promoted so it is shown");
+    w.monitors = saved;
+  });
+
+  it("follows main to another WT window (tab torn out) and gives the old window its frame back", async () => {
+    const w = new FakeWin32();
+    const main = w.addMainWindow();
+    let current = main.hwnd;
+    const tiler = new Tiler(w, main.hwnd, { terminalSize: () => undefined, resolveMain: () => current });
+    const agent = w.addWindow({ title: "a" });
+    tiler.add("a");
+    tiler.attach("a", agent.hwnd);
+    const original = w.frameOf(main.hwnd);
+    await tiler.apply();
+    const torn = w.addWindow({ title: "pi (torn out)", frame: { x: 500, y: 300, width: 900, height: 700 } });
+    current = torn.hwnd;
+    assert.equal(tiler.poll().relayout, true);
+    assert.equal(tiler.main, torn.hwnd);
+    assert.deepEqual(w.frameOf(main.hwnd), original, "old window restored");
+    await tiler.apply();
+    assert.deepEqual(w.frameOf(torn.hwnd), tiler.lastPlan!.layout.main);
+  });
+});
+
+describe("Tiler robustness", () => {
+  it("skips hung windows entirely", async () => {
+    const { w, main, tiler, agents } = setup(2);
+    w.hung.add(agents[0]!.hwnd);
+    await tiler.apply();
+    assert.ok(w.batches.flat().every((p) => p.hwnd !== agents[0]!.hwnd));
+    assert.ok(w.shows.every(([h]) => h !== agents[0]!.hwnd));
+    assert.deepEqual(w.frameOf(agents[1]!.hwnd), tiler.targetOf("a1"));
+    assert.deepEqual(w.frameOf(main.hwnd), tiler.lastPlan!.layout.main);
+  });
+
+  it("un-maximizes a maximized agent window before placing it", async () => {
+    const { w, main, tiler, agents } = setup(2);
+    w.windows.get(agents[1]!.hwnd)!.zoomed = true;
+    await tiler.apply();
+    assert.ok(!w.isZoomed(agents[1]!.hwnd));
+    assert.ok(w.shows.some(([h, cmd]) => h === agents[1]!.hwnd && cmd === SW.SHOWNOACTIVATE));
+    assertMatchesLayout(w, main.hwnd, tiler);
+  });
+
+  it("falls back to one SetWindowPos per window when the batch fails", async () => {
+    const logs: string[] = [];
+    const { w, main, tiler } = setup(2, { log: (m) => logs.push(m) });
+    w.failDefer = true;
+    await tiler.apply();
+    assert.equal(w.singles.length, 3);
+    assertMatchesLayout(w, main.hwnd, tiler);
+    assert.ok(logs.some((l) => /one by one/.test(l)));
+  });
+
+  it("reads a window back again about 100 ms after it changed DPI (moved to another monitor)", async () => {
+    const w = new FakeWin32();
+    w.monitors = [
+      { handle: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 }, work: { x: 0, y: 0, width: 1920, height: 1032 }, primary: true, dpi: 96 },
+      { handle: 2, bounds: { x: 1920, y: 0, width: 2560, height: 1440 }, work: { x: 1920, y: 0, width: 2560, height: 1392 }, primary: false, dpi: 144 },
+    ];
+    const main = w.addMainWindow({ x: 100, y: 100, width: 800, height: 600 });
+    const slept: number[] = [];
+    let late: (() => void) | undefined;
+    const tiler = new Tiler(w, main.hwnd, {
+      terminalSize: () => undefined,
+      sleep: async (ms) => {
+        slept.push(ms);
+        late?.();
+        late = undefined;
+      },
+    });
+    const wins = [0, 1, 2].map((i) => {
+      const win = w.addWindow({ title: `a${i}`, frame: { x: 200 + i, y: 200, width: 600, height: 400 } });
+      tiler.add(`a${i}`);
+      tiler.attach(`a${i}`, win.hwnd);
+      return win;
+    });
+    const real = w.deferWindowPos.bind(w);
+    let batches = 0;
+    w.deferWindowPos = (placements) => {
+      real(placements);
+      if (++batches === 1) {
+        // a0 crossed to the 144 DPI monitor; WT rescales it only a little later.
+        late = () => {
+          const win = w.windows.get(wins[0]!.hwnd)!;
+          win.outer = { ...win.outer, width: Math.round(win.outer.width * 1.5) };
+        };
+      }
+      return true;
+    };
+    await tiler.apply();
+    assert.ok(slept.includes(100), "second read-back after the DPI change");
+    for (const a of tiler.lastPlan!.layout.agents) assert.deepEqual(w.frameOf(tiler.get(a.id)!.hwnd), a.rect);
+  });
+
+  it("reports an auto-minimized agent that is then minimized explicitly only once", async () => {
+    const { w, tiler } = setup(6);
+    const extra = w.addWindow({ title: "a6" });
+    tiler.add("a6");
+    tiler.attach("a6", extra.hwnd);
+    const first = await tiler.apply();
+    assert.deepEqual(first.minimizedChanges, [{ agentId: "a0", minimized: true, reason: "auto" }]);
+    tiler.minimize("a0");
+    const second = await tiler.apply();
+    assert.deepEqual(second.minimizedChanges, [], "no spurious {minimized: false, auto}");
+  });
+
+  it("restoreMain() gives main its frame back in one SetWindowPos, on the monitor it is on now", async () => {
+    const w = new FakeWin32();
+    w.monitors = [
+      { handle: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 }, work: { x: 0, y: 0, width: 1920, height: 1032 }, primary: true, dpi: 96 },
+      { handle: 2, bounds: { x: 1920, y: 0, width: 2560, height: 1440 }, work: { x: 1920, y: 0, width: 2560, height: 1392 }, primary: false, dpi: 96 },
+    ];
+    const main = w.addMainWindow({ x: 100, y: 100, width: 800, height: 600 });
+    const tiler = new Tiler(w, main.hwnd, { terminalSize: () => undefined });
+    const agent = w.addWindow({ title: "a" });
+    tiler.add("a");
+    tiler.attach("a", agent.hwnd);
+    await tiler.apply();
+    // The user dragged main to the second monitor since.
+    w.windows.get(main.hwnd)!.outer = outerOf({ x: 1920, y: 0, width: 1280, height: 1392 });
+    assert.equal(tiler.restoreMain(), true);
+    assert.equal(w.singles.length, 1);
+    assert.deepEqual(w.frameOf(main.hwnd), { x: 2020, y: 100, width: 800, height: 600 });
+    assert.equal(tiler.restoreMain(), false, "only once");
   });
 
   it("rejects duplicate and unknown agents", () => {

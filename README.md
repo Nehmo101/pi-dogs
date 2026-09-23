@@ -141,6 +141,12 @@ invalid values are reported and replaced by the default.
 | `mirrorLines` | `400` | Lines kept per dog for the mirror view |
 | `layout` | `{}` | Window layout preferences, see [docs/window-backend.md](docs/window-backend.md) |
 
+A task or steer message may be up to 512 KiB; put larger material into a
+file and name it. A dog started in the main pi's folder gets the main pi's
+project-trust decision; in another folder it gets the decision you stored
+for that folder, or runs without project-local resources (`--no-approve`),
+so it never waits at pi's trust prompt.
+
 ## Troubleshooting
 
 - **"pi is not running inside Windows Terminal"** – start pi from a Windows

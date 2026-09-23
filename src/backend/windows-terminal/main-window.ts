@@ -10,31 +10,29 @@
  *    (class CASCADIA_HOSTING_WINDOW_CLASS). Verified with WT 1.24. This is
  *    exact even with several WT windows open and does not depend on focus
  *    or titles.
- * 2. Fallback: when running inside WT (WT_SESSION is set) and the foreground
- *    window is a WT window. pi was just started by typing into it, so at
- *    startup this is almost always right; it is only used if 1 fails.
+ * 2. There is deliberately no fallback. WT_SESSION is inherited by conhost
+ *    and VS Code terminals started from a WT tab, and the backend starts
+ *    lazily (at the first open), so "the foreground WT window" can be any
+ *    window of the user. If 1 fails, main is not moved at all; its area in
+ *    the layout simply stays empty (agents do not stretch over it).
  *
  * Titles are not used: pi and the user may change the tab title at any time.
+ * Cheap (three calls), so the tiler re-resolves it on every poll to follow a
+ * tab that was torn out into another window.
  */
 
 import { WT_WINDOW_CLASS, type Hwnd, type Win32 } from "./win32.ts";
 
 export type MainWindowResult =
-  | { hwnd: Hwnd; source: "console-owner" | "foreground" }
+  | { hwnd: Hwnd; source: "console-owner" }
   | { hwnd: 0; source: "none"; reason: string };
 
-export function findMainWindow(win32: Win32, env: NodeJS.ProcessEnv = process.env): MainWindowResult {
+export function findMainWindow(win32: Win32): MainWindowResult {
   const consoleWindow = win32.getConsoleWindow();
   if (consoleWindow) {
     const root = win32.getRootOwner(consoleWindow);
     if (root && root !== consoleWindow && win32.getClassName(root) === WT_WINDOW_CLASS) {
       return { hwnd: root, source: "console-owner" };
-    }
-  }
-  if (env["WT_SESSION"]) {
-    const foreground = win32.getForegroundWindow();
-    if (foreground && win32.getClassName(foreground) === WT_WINDOW_CLASS) {
-      return { hwnd: foreground, source: "foreground" };
     }
   }
   return {

@@ -40,6 +40,13 @@ export interface BackendEvents {
    * automatic layout never emit it.
    */
   onMinimizedChange?(ref: PaneRef, minimized: boolean, reason: "auto" | "user"): void;
+  /**
+   * A new agent window took the foreground and it could not be given back
+   * (Windows' foreground lock, typically when the previous window was not a
+   * Windows Terminal window). Keystrokes now go to the agent window; the hub
+   * may tell the user. Optional.
+   */
+  onFocusNotReturned?(ref: PaneRef): void;
 }
 
 export interface PaneBackend {

@@ -10,13 +10,13 @@
 // the real exit code lives in the exit file (docs/protocol.md).
 //
 // The launch file is only read here. The agent extension inside pi deletes it
-// after reading, because it contains the dog's pipe token.
+// after reading, because it contains the dog's secrets (pipe token, hub secret).
 //
 // Plain JavaScript on purpose: Node does not strip types for files under
 // node_modules, and this script must work wherever the package is installed.
 // The exit-file format mirrors ExitFile in src/protocol/launch.ts.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -106,7 +106,17 @@ function main() {
   });
 }
 
-const isMain =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+// Compare real paths: the package may be reached through a junction, symlink
+// or subst drive, and then argv[1] and import.meta.url name different paths.
+function canonical(path) {
+  let real;
+  try {
+    real = realpathSync.native(path);
+  } catch {
+    real = resolve(path);
+  }
+  return process.platform === "win32" ? real.toLowerCase() : real;
+}
+
+const isMain = process.argv[1] !== undefined && canonical(process.argv[1]) === canonical(fileURLToPath(import.meta.url));
 if (isMain) main();

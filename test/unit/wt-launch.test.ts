@@ -79,26 +79,27 @@ describe("findMainWindow", () => {
     const w = new FakeWin32();
     const main = w.addMainWindow();
     w.foreground = 0;
-    assert.deepEqual(findMainWindow(w, {}), { hwnd: main.hwnd, source: "console-owner" });
+    assert.deepEqual(findMainWindow(w), { hwnd: main.hwnd, source: "console-owner" });
   });
 
-  it("falls back to the foreground WT window inside WT", () => {
+  it("never falls back to the foreground window (it may belong to the user)", () => {
     const w = new FakeWin32();
-    const fg = w.addWindow({ title: "pi" });
+    const fg = w.addWindow({ title: "someone else's WT window" });
     w.foreground = fg.hwnd;
-    assert.deepEqual(findMainWindow(w, { WT_SESSION: "x" }), { hwnd: fg.hwnd, source: "foreground" });
-    assert.equal(findMainWindow(w, {}).source, "none");
+    const conhost = w.addWindow({ className: "ConsoleWindowClass" });
+    w.consoleWindow = conhost.hwnd; // e.g. pi in conhost started from a WT tab: WT_SESSION is inherited
+    assert.deepEqual(findMainWindow(w), { hwnd: 0, source: "none", reason: "the console window is not owned by a Windows Terminal window" });
   });
 
   it("reports why it found nothing", () => {
     const w = new FakeWin32();
     const conhost = w.addWindow({ className: "ConsoleWindowClass" });
     w.consoleWindow = conhost.hwnd;
-    const result = findMainWindow(w, {});
+    const result = findMainWindow(w);
     assert.equal(result.hwnd, 0);
     assert.match(result.source === "none" ? result.reason : "", /not owned/);
     w.consoleWindow = 0;
-    const none = findMainWindow(w, {});
+    const none = findMainWindow(w);
     assert.match(none.source === "none" ? none.reason : "", /no console/);
   });
 });

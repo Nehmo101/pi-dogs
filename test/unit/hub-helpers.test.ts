@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 
 import { parseNewArgs, parseSubcommand, splitDogAndText } from "../../src/hub/command-args.ts";
 import { buildResultText, formatCost, formatElapsed, formatTokens, formatUsage } from "../../src/hub/format.ts";
-import { buildPiArgs, currentPiCommand } from "../../src/hub/pi-command.ts";
+import { buildPiArgs, currentPiCommand, dogProjectTrust } from "../../src/hub/pi-command.ts";
 import { Registry } from "../../src/hub/registry.ts";
 import { forkableEntries, seedSessionFile, sessionFileName, type SeedEntry } from "../../src/hub/session-seed.ts";
 import { rgb, stateBadge, toRow, visibleDogs } from "../../src/hub/ui/rows.ts";
@@ -15,6 +15,7 @@ const newDog = (agentId: string, name: string, startedAt = 0) => ({
   agentId,
   name,
   token: "t",
+  hubSecret: "h",
   color: "#102030",
   model: "ollama/qwen3.5:4b",
   mode: "autonomous" as const,
@@ -57,6 +58,17 @@ describe("/dogs argument parsing", () => {
     });
     assert.deepEqual(parseNewArgs("just a task"), { task: "just a task" });
   });
+
+  it("keeps the text after the name and the task verbatim (no whitespace squashing)", () => {
+    const r = new Registry();
+    r.add(newDog("a", "Bello Baggins"));
+    const steer = "  Use   this:\n\tline 1\n\tline 2  ";
+    const { sub, rest } = parseSubcommand(`steer Bello Baggins ${steer}`);
+    assert.equal(sub, "steer");
+    assert.equal(splitDogAndText(rest, r)!.text, "Use   this:\n\tline 1\n\tline 2");
+    assert.equal(parseNewArgs("-i  --name  Scout  fix   a\n  b").task, "fix   a\n  b");
+    assert.deepEqual(parseSubcommand("  kill   Rex  "), { sub: "kill", rest: "Rex", raw: "kill" });
+  });
 });
 
 describe("formatting", () => {
@@ -98,6 +110,28 @@ describe("pi command line", () => {
       "--session", "s.jsonl", "-e", "agent.ts", "--pi-dogs-launch=C:\\t\\launch.json", "--name", "Bello Baggins",
       "--model", "ollama/qwen3.5:4b", "--thinking", "high", "--tools", "read,grep,subagent_done", "--approve",
     ]);
+  });
+
+  it("always decides project trust explicitly when pi would otherwise prompt", () => {
+    const base = { agentExtension: "a", launchFile: "l", sessionFile: "s", name: "n" };
+    assert.ok(buildPiArgs({ ...base, approve: false }).includes("--no-approve"));
+    assert.ok(!buildPiArgs({ ...base, approve: undefined }).some((a) => a.includes("approve")));
+
+    const main = resolve("C:\\work\\proj");
+    const trust = (cwd: string, o: { needs?: boolean; stored?: boolean | null; mainTrusted?: boolean } = {}) =>
+      dogProjectTrust({
+        cwd,
+        mainCwd: main,
+        mainTrusted: o.mainTrusted ?? true,
+        needsTrust: () => o.needs ?? true,
+        storedDecision: () => o.stored ?? null,
+      });
+    assert.equal(trust(main), true, "same folder: the main pi's decision");
+    assert.equal(trust(main, { mainTrusted: false }), false);
+    assert.equal(trust(resolve("C:\\other"), { needs: false }), undefined, "nothing to trust: pi does not ask");
+    assert.equal(trust(resolve("C:\\other"), { stored: true }), true, "remembered decision");
+    assert.equal(trust(resolve("C:\\other"), { stored: false }), false);
+    assert.equal(trust(resolve("C:\\other")), false, "unknown folder: never trust silently, never prompt");
   });
 
   it("reuses the running pi: node + cli script, a pi binary, or pi from PATH", () => {

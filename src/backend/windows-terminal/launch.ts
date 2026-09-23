@@ -90,6 +90,23 @@ export interface DiscoverOptions {
   now?: () => number;
   /** Stop early (e.g. the backend was disposed). */
   cancelled?: () => boolean;
+  /**
+   * Fallback for captions that do not show the tab title (for example with
+   * `showTerminalTitleInTitlebar: false`): when exactly one new, visible WT
+   * window (not in `before`, not in `exclude`) has stayed unmatched for this
+   * long, accept it. Off when undefined.
+   */
+  fallbackAfterMs?: number;
+  /**
+   * Fallback only: where the new window's visible frame should appear (from
+   * `--pos`). Candidates further away than 48 px are ignored, so a WT
+   * window the user opens at the same time is not taken for ours.
+   */
+  expectedAt?: { x: number; y: number };
+  /** Windows that are already taken (our other agent windows, main). */
+  exclude?: () => ReadonlySet<Hwnd>;
+  /** Called when the fallback accepted a window (for the log). */
+  onFallback?: (hwnd: Hwnd, caption: string) => void;
 }
 
 /** Snapshot of the WT windows that exist right now. */
@@ -103,9 +120,16 @@ export function snapshotWtWindows(win32: Win32): Set<Hwnd> {
  * 20-30 ms later (WT 1.24). Only a shown window has its final placement and
  * has taken the foreground, so a hidden one does not count as found yet.
  */
-export function findNewWindow(win32: Win32, title: string, before: ReadonlySet<Hwnd>): Hwnd {
+export function findNewWindow(
+  win32: Win32,
+  title: string,
+  before: ReadonlySet<Hwnd>,
+  { visibleOnly = true }: { visibleOnly?: boolean } = {},
+): Hwnd {
   for (const hwnd of win32.findWindowsByClass(WT_WINDOW_CLASS)) {
-    if (!before.has(hwnd) && win32.getWindowText(hwnd) === title && win32.isWindowVisible(hwnd)) return hwnd;
+    if (!before.has(hwnd) && win32.getWindowText(hwnd) === title && (!visibleOnly || win32.isWindowVisible(hwnd))) {
+      return hwnd;
+    }
   }
   return 0;
 }
@@ -120,12 +144,31 @@ export async function discoverWindow(
   const now = options.now ?? (() => performance.now());
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const deadline = now() + options.timeoutMs;
+  let single: { hwnd: Hwnd; since: number } | undefined;
   for (;;) {
     const hwnd = findNewWindow(win32, title, before);
     if (hwnd) return hwnd;
+    if (options.fallbackAfterMs !== undefined) {
+      const taken = options.exclude?.() ?? new Set<Hwnd>();
+      const fresh = win32
+        .findWindowsByClass(WT_WINDOW_CLASS)
+        .filter((h) => !before.has(h) && !taken.has(h) && win32.isWindowVisible(h) && near(win32, h, options.expectedAt));
+      if (fresh.length !== 1) single = undefined;
+      else if (!single || single.hwnd !== fresh[0]) single = { hwnd: fresh[0]!, since: now() };
+      else if (now() - single.since >= options.fallbackAfterMs) {
+        options.onFallback?.(single.hwnd, win32.getWindowText(single.hwnd));
+        return single.hwnd;
+      }
+    }
     if (now() >= deadline || options.cancelled?.()) return 0;
     await sleep(options.pollMs);
   }
+}
+
+function near(win32: Win32, hwnd: Hwnd, at: { x: number; y: number } | undefined): boolean {
+  if (!at) return true;
+  const frame = win32.getFrameBounds(hwnd);
+  return !!frame && Math.abs(frame.x - at.x) <= 48 && Math.abs(frame.y - at.y) <= 48;
 }
 
 /**

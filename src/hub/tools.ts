@@ -106,7 +106,7 @@ export function registerSubagentTool(pi: ExtensionAPI, runtime: HubRuntime): voi
         forkEntries: params.fork ? (ctx.sessionManager.getBranch() as unknown as SeedEntry[]) : undefined,
         parentSession: ctx.sessionManager.getSessionFile(),
         sessionDir: runtime.sessionDirFor(ctx),
-        approve: cwd === ctx.cwd && ctx.isProjectTrusted(),
+        approve: runtime.dogTrust(ctx, cwd),
       });
       return {
         content: [

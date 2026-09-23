@@ -9,7 +9,19 @@ import { FakeWin32 } from "../helpers/fake-win32.ts";
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Simulates wt.exe: a window with the requested title shows up a few ms later and takes the foreground. */
-function fakeWt(w: FakeWin32, calls: string[][], behaviour: { failFirst?: boolean; never?: boolean; noSteal?: boolean } = {}) {
+interface WtBehaviour {
+  failFirst?: boolean;
+  /** Fail after handing the launch over (the window still comes). */
+  failAfterLaunch?: boolean;
+  never?: boolean;
+  noSteal?: boolean;
+  /** The window appears only after this many ms. */
+  lateMs?: number;
+  /** The caption does not show the tab title (showTerminalTitleInTitlebar: false). */
+  untitled?: boolean;
+}
+
+function fakeWt(w: FakeWin32, calls: string[][], behaviour: WtBehaviour = {}) {
   let failed = false;
   return async (_exe: string, argv: readonly string[]) => {
     calls.push([...argv]);
@@ -18,7 +30,7 @@ function fakeWt(w: FakeWin32, calls: string[][], behaviour: { failFirst?: boolea
       throw new Error("wt.exe exited with code 1");
     }
     if (behaviour.never) return;
-    const title = argv[argv.indexOf("--title") + 1]!.replace(/\\;/g, ";");
+    const title = behaviour.untitled ? "Terminal" : argv[argv.indexOf("--title") + 1]!.replace(/\\;/g, ";");
     const [x, y] = argv[argv.indexOf("--pos") + 1]!.split(",").map(Number) as [number, number];
     setTimeout(() => {
       const win = w.addWindow({ title, frame: { x: x - 1, y, width: 700, height: 500 }, visible: false });
@@ -26,7 +38,12 @@ function fakeWt(w: FakeWin32, calls: string[][], behaviour: { failFirst?: boolea
         win.visible = true;
         if (!behaviour.noSteal) w.foreground = win.hwnd; // new WT windows normally take the foreground
       }, 3);
-    }, 5);
+    }, behaviour.lateMs ?? 5);
+    if (behaviour.failAfterLaunch && !failed) {
+      failed = true;
+      await sleep(20);
+      throw new Error("wt.exe exited with code 1");
+    }
   };
 }
 
@@ -174,6 +191,82 @@ describe("WindowsTerminalBackend", () => {
     await backend.relayout();
     assert.equal(backend.diagnostics().windows.length, 0);
     assert.deepEqual(w.frameOf(main.hwnd), { x: 200, y: 150, width: 1295, height: 818 }, "main got its size back");
+    backend.dispose();
+  });
+
+  it("closes a window that appears after open() gave up, instead of leaving an orphan", async () => {
+    const { w, backend, logs } = setup({ wt: { lateMs: 80 }, discoveryTimeoutMs: 30 });
+    await assert.rejects(backend.open(spec(0)), /did not appear/);
+    for (let i = 0; i < 60 && !logs.some((l) => l.includes("closing it")); i++) await sleep(10);
+    const late = w.posted.find(([, msg]) => msg === WM_CLOSE);
+    assert.ok(late, "WM_CLOSE posted to the late window");
+    assert.equal(w.findWindowsByClass("CASCADIA_HOSTING_WINDOW_CLASS").filter((h) => w.getWindowText(h) !== "pi").length, 0);
+    backend.dispose();
+  });
+
+  it("accepts the only new window near the slot when its caption does not show the title", async () => {
+    const { w, backend, logs } = setup({ wt: { untitled: true }, discoveryTimeoutMs: 2000, discoveryFallbackMs: 40 });
+    const unrelated = w.addWindow({ title: "Terminal", frame: { x: 50, y: 50, width: 600, height: 400 } });
+    await backend.open(spec(0));
+    const hwnd = backend.diagnostics().windows[0]!.hwnd;
+    assert.notEqual(hwnd, unrelated.hwnd);
+    assert.deepEqual(w.frameOf(hwnd), { x: 1720, y: 0, width: 1720, height: 1392 });
+    assert.ok(logs.some((l) => l.includes("without a title match")));
+    backend.dispose();
+  });
+
+  it("does not take a user's new WT window elsewhere on screen for the agent window", async () => {
+    const { w, backend } = setup({ wt: { never: true }, discoveryTimeoutMs: 150, discoveryFallbackMs: 20 });
+    const opening = backend.open(spec(0));
+    await sleep(10);
+    const users = w.addWindow({ title: "Terminal", frame: { x: 300, y: 300, width: 600, height: 400 } });
+    await assert.rejects(opening, /did not appear/);
+    assert.ok(w.isWindow(users.hwnd));
+    backend.dispose();
+  });
+
+  it("does not retry wt.exe when the window came anyway (no agent started twice)", async () => {
+    const { backend, calls, logs } = setup({ wt: { failAfterLaunch: true } });
+    await backend.open(spec(0));
+    assert.equal(calls.length, 1);
+    assert.ok(logs.some((l) => l.includes("not retrying")));
+    backend.dispose();
+  });
+
+  it("gives main its original frame back synchronously on dispose", async () => {
+    const { w, main, backend } = setup();
+    await backend.open(spec(0));
+    assert.deepEqual(w.frameOf(main.hwnd), { x: 0, y: 0, width: 1720, height: 1392 });
+    backend.dispose();
+    assert.deepEqual(w.frameOf(main.hwnd), { x: 200, y: 150, width: 1295, height: 818 });
+  });
+
+  it("never moves a window it does not own when main is not found", async () => {
+    const w = new FakeWin32();
+    const users = w.addWindow({ title: "someone's WT window", frame: { x: 200, y: 150, width: 1295, height: 818 } });
+    w.foreground = users.hwnd;
+    const calls: string[][] = [];
+    const backend = new WindowsTerminalBackend({
+      win32: w, wtExe: "wt.exe", runWt: fakeWt(w, calls, { noSteal: true }), env: { WT_SESSION: "inherited" },
+      terminalSize: () => undefined, relayoutDelayMs: 1, relayoutMaxDelayMs: 20, discoveryTimeoutMs: 500,
+    });
+    await backend.open(spec(0));
+    assert.equal(backend.diagnostics().main!.source, "none");
+    assert.deepEqual(w.frameOf(users.hwnd), { x: 200, y: 150, width: 1295, height: 818 });
+    assert.ok(w.batches.flat().every((p) => p.hwnd !== users.hwnd));
+    // Main's area stays empty: the agent does not stretch over it.
+    assert.deepEqual(w.frameOf(backend.diagnostics().windows[0]!.hwnd), { x: 1720, y: 0, width: 1720, height: 1392 });
+    backend.dispose();
+    assert.deepEqual(w.frameOf(users.hwnd), { x: 200, y: 150, width: 1295, height: 818 });
+  });
+
+  it("tells the hub when the focus could not be given back", async () => {
+    const { w, backend } = setup();
+    const notified: string[] = [];
+    backend.setEvents({ onFocusNotReturned: (ref) => notified.push(ref.agentId) });
+    w.lockForeground = true;
+    await backend.open(spec(0));
+    assert.deepEqual(notified, ["dog-0"]);
     backend.dispose();
   });
 

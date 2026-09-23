@@ -35,8 +35,8 @@ export default function hubExtension(pi: ExtensionAPI): void {
   registerShortcuts(pi, runtime, agentDir);
   registerRenderers(pi);
 
-  pi.on("session_start", async (_event, ctx) => {
-    await runtime.start(ctx);
+  pi.on("session_start", async (event, ctx) => {
+    await runtime.start(ctx, event.reason);
     // Registered here, not in the factory: the description lists the models usable right now.
     registerSubagentTool(pi, runtime);
     for (const warning of warnings) runtime.notify(`pi-dogs.json: ${warning}`, "warning");

@@ -3,10 +3,13 @@ import { describe, it } from "node:test";
 
 import {
   DEFAULT_MAX_LINE_BYTES,
+  encodedTextBytes,
   encodeMessage,
   FramingError,
   JsonlDecoder,
+  MAX_TEXT_BYTES,
   parseMessage,
+  truncateText,
   type DecodeResult,
 } from "../../src/protocol/framing.ts";
 import type { Message } from "../../src/protocol/types.ts";
@@ -22,6 +25,7 @@ const SAMPLES: Message[] = [
     agentId: "scout",
     config: { mode: "autonomous", closeOnDone: true, hubGoneGraceMs: 30000, name: "Bello Baggins" },
     resumed: false,
+    hubSecret: "hub-s3cret",
   },
   { v: 1, type: "ack", agentId: "scout", ref: "done-1" },
   { v: 1, type: "reject", agentId: "scout", reason: "invalid token" },
@@ -227,6 +231,44 @@ describe("message validation", () => {
       "INVALID_MESSAGE",
     ],
     ["bad event kind", JSON.stringify({ v: 1, type: "event", agentId: "a", event: { kind: "nope" } }), "INVALID_MESSAGE"],
+    // Nested payloads: a valid kind with missing or wrong fields must not reach the hub's handlers.
+    ["text_delta without text", JSON.stringify({ v: 1, type: "event", agentId: "a", event: { kind: "text_delta" } }), "INVALID_MESSAGE"],
+    [
+      "tool_start without tool",
+      JSON.stringify({ v: 1, type: "event", agentId: "a", event: { kind: "tool_start", toolCallId: "c" } }),
+      "INVALID_MESSAGE",
+    ],
+    [
+      "tool_start with non-string args",
+      JSON.stringify({ v: 1, type: "event", agentId: "a", event: { kind: "tool_start", toolCallId: "c", tool: "bash", args: { a: 1 } } }),
+      "INVALID_MESSAGE",
+    ],
+    [
+      "tool_end without isError",
+      JSON.stringify({ v: 1, type: "event", agentId: "a", event: { kind: "tool_end", toolCallId: "c", tool: "bash" } }),
+      "INVALID_MESSAGE",
+    ],
+    [
+      "user_message with a bad source",
+      JSON.stringify({ v: 1, type: "event", agentId: "a", event: { kind: "user_message", text: "x", source: "robot" } }),
+      "INVALID_MESSAGE",
+    ],
+    ["usage without numbers", JSON.stringify({ v: 1, type: "status", agentId: "a", state: "idle", usage: {}, model: "m" }), "INVALID_MESSAGE"],
+    [
+      "done with a string cost",
+      JSON.stringify({ v: 1, type: "done", agentId: "a", summary: "s", usage: { input: 1, output: 1, cost: "1" }, sessionFile: "" }),
+      "INVALID_MESSAGE",
+    ],
+    [
+      "welcome without hub secret",
+      JSON.stringify({ v: 1, type: "welcome", agentId: "a", config: { mode: "autonomous", closeOnDone: true, hubGoneGraceMs: 0, name: "n" }, resumed: false }),
+      "INVALID_MESSAGE",
+    ],
+    [
+      "welcome with a bad config",
+      JSON.stringify({ v: 1, type: "welcome", agentId: "a", config: { mode: "x", closeOnDone: true, hubGoneGraceMs: 0, name: "n" }, resumed: false, hubSecret: "s" }),
+      "INVALID_MESSAGE",
+    ],
   ];
 
   for (const [name, input, code] of cases) {
@@ -239,5 +281,24 @@ describe("message validation", () => {
   it("allows unknown extra fields", () => {
     const msg = parseMessage(JSON.stringify({ v: 1, type: "ping", agentId: "a", extra: true }));
     assert.equal(msg.type, "ping");
+  });
+});
+
+describe("text size limit", () => {
+  it("measures the encoded size, escapes included", () => {
+    assert.equal(encodedTextBytes("ab"), 4);
+    assert.equal(encodedTextBytes("\u0001"), 8, "a control character becomes \\u0001 in quotes");
+    assert.equal(encodedTextBytes("ä"), 4);
+  });
+
+  it("truncates so that a done summary always fits one line", () => {
+    assert.equal(truncateText("short"), "short");
+    for (const huge of ["x".repeat(2_000_000), "\u0001".repeat(300_000), "ü".repeat(600_000)]) {
+      const cut = truncateText(huge);
+      assert.ok(encodedTextBytes(cut) <= MAX_TEXT_BYTES, `${encodedTextBytes(cut)} bytes`);
+      assert.match(cut, /truncated by pi-dogs\)$/);
+      const line = encodeMessage({ v: 1, type: "done", agentId: "a", id: "d", summary: cut, usage: { input: 1, output: 1 }, sessionFile: "C:\\s.jsonl" });
+      assert.ok(Buffer.byteLength(line) < DEFAULT_MAX_LINE_BYTES);
+    }
   });
 });

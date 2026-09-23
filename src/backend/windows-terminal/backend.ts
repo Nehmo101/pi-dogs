@@ -23,7 +23,7 @@ import type { BackendEvents, OpenSpec, PaneBackend, PaneRef } from "../pane-back
 import type { LayoutPrefs, Rect } from "../../layout/computeLayout.ts";
 import { minimumSizes } from "../../layout/computeLayout.ts";
 import { launchGeometry } from "./geometry.ts";
-import { agentTitle, discoverWindow, findWtExe, runWt, snapshotWtWindows, uniqueTitle } from "./launch.ts";
+import { agentTitle, discoverWindow, findNewWindow, findWtExe, runWt, snapshotWtWindows, uniqueTitle } from "./launch.ts";
 import { findMainWindow, type MainWindowResult } from "./main-window.ts";
 import { CoalescingScheduler } from "./scheduler.ts";
 import { Tiler, type AnimationConfig, type ApplyResult, type MinimizedChange, type Plan } from "./tiler.ts";
@@ -39,6 +39,11 @@ export interface WindowsTerminalBackendOptions {
   animation?: AnimationConfig | false;
   /** How long to wait for a new window to appear. Default 8000 ms. */
   discoveryTimeoutMs?: number;
+  /**
+   * Accept the only new WT window near the slot after this long even if its
+   * caption does not match (captions without the tab title). Default 1000 ms.
+   */
+  discoveryFallbackMs?: number;
   /** Interval of the close/minimize/monitor poll. Default 250 ms. */
   pollIntervalMs?: number;
   /** Quiet time that ends a burst of relayout requests. Default 30 ms. */
@@ -145,15 +150,23 @@ export class WindowsTerminalBackend implements PaneBackend {
         args: spec.args,
       });
       const before = snapshotWtWindows(win32);
-      await this.#launch(argv);
+      await this.#launch(argv, title, before);
 
       // 3. Find it, hand the focus back, place it exactly.
+      const timeoutMs = this.#options.discoveryTimeoutMs ?? 8000;
       const hwnd = await discoverWindow(win32, title, before, {
-        timeoutMs: this.#options.discoveryTimeoutMs ?? 8000,
+        timeoutMs,
         pollMs: 15,
         cancelled: () => this.#disposed || !tiler.get(spec.agentId),
+        fallbackAfterMs: this.#options.discoveryFallbackMs ?? 1000,
+        expectedAt: { x: pos.x - 1, y: pos.y },
+        exclude: () => this.#takenWindows(),
+        onFallback: (found, caption) =>
+          this.#log(`window ${found} accepted for ${spec.agentId} without a title match (caption ${JSON.stringify(caption)}); is showTerminalTitleInTitlebar off?`),
       });
       if (!hwnd) {
+        // The window may still come (slow start, or we gave up early): close it when it does.
+        this.#closeWhenItAppears(title, before, timeoutMs);
         if (!tiler.get(spec.agentId)) throw new Error(`agent ${spec.agentId} was closed while its window was opening`);
         throw new Error(
           `the window for ${spec.name} did not appear within ${this.#options.discoveryTimeoutMs ?? 8000} ms`,
@@ -168,7 +181,7 @@ export class WindowsTerminalBackend implements PaneBackend {
       this.#log(
         `window ${hwnd} for ${spec.agentId} appeared at ${rectText(appeared)} (slot ${rectText(target)}, --pos ${pos.x},${pos.y} --size ${size.cols},${size.rows})`,
       );
-      const focusBack = this.#returnFocus(foreground, hwnd);
+      const focusBack = this.#returnFocus(foreground, hwnd, spec.agentId);
       await scheduler.request();
       await focusBack;
       return { agentId: spec.agentId };
@@ -247,6 +260,12 @@ export class WindowsTerminalBackend implements PaneBackend {
     if (this.#pollTimer) clearInterval(this.#pollTimer);
     this.#pollTimer = undefined;
     this.#scheduler?.dispose();
+    // The pending relayout is gone; give main its space back right here.
+    try {
+      if (this.#tiler?.restoreMain()) this.#log("main pi window restored");
+    } catch (error) {
+      this.#log(`could not restore the main window: ${(error as Error).message}`);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -263,7 +282,7 @@ export class WindowsTerminalBackend implements PaneBackend {
       if (!loaded.ok) throw loaded.error;
       win32 = loaded.win32;
     }
-    const main = findMainWindow(win32, this.#env);
+    const main = findMainWindow(win32);
     this.#main = main;
     if (main.source === "none") this.#log(`main pi window not found (${main.reason}); agents are tiled without it`);
     else this.#log(`main pi window ${main.hwnd} (${main.source})`);
@@ -276,6 +295,8 @@ export class WindowsTerminalBackend implements PaneBackend {
       useSecondaryMonitors: this.#options.useSecondaryMonitors ?? true,
       animation: this.#options.animation ?? false,
       terminalSize,
+      resolveMain: () => findMainWindow(win32).hwnd,
+      log: (message) => this.#log(message),
     });
     const scheduler = new CoalescingScheduler(() => this.#apply(tiler), {
       delayMs: this.#options.relayoutDelayMs ?? 30,
@@ -312,6 +333,7 @@ export class WindowsTerminalBackend implements PaneBackend {
       this.#log(`poll failed: ${(error as Error).message}`);
       return;
     }
+    if (this.#main && tiler.main !== this.#main.hwnd && tiler.main) this.#main = { hwnd: tiler.main, source: "console-owner" };
     for (const agentId of result.closed) this.#safe(() => this.#events.onClosed?.({ agentId }));
     this.#emitMinimized(result.minimizedChanges);
     if (result.relayout) void this.#scheduler?.request().catch((error) => this.#log(`relayout failed: ${error}`));
@@ -324,18 +346,47 @@ export class WindowsTerminalBackend implements PaneBackend {
   }
 
 
-  async #launch(argv: string[]): Promise<void> {
+  async #launch(argv: string[], title: string, before: ReadonlySet<Hwnd>): Promise<void> {
     const wtExe = this.#options.wtExe ?? findWtExe(this.#env) ?? "wt.exe";
     const run = this.#options.runWt ?? runWt;
     try {
       await run(wtExe, argv);
     } catch (error) {
-      // Only retry when wt.exe itself failed: then nothing was launched, and a
-      // retry cannot start the agent twice.
-      this.#log(`wt.exe failed (${(error as Error).message}), retrying once`);
+      // Retry only if nothing was launched: a window with our title (even a
+      // still hidden one) means wt.exe failed after handing the work over,
+      // and a retry would start the agent twice.
       await sleep(250);
+      if (findNewWindow(this.#win32!, title, before, { visibleOnly: false })) {
+        this.#log(`wt.exe failed (${(error as Error).message}), but the window is there; not retrying`);
+        return;
+      }
+      this.#log(`wt.exe failed (${(error as Error).message}), retrying once`);
       await run(wtExe, argv);
     }
+  }
+
+  /** Our windows (agents and main): never taken for a new agent window. */
+  #takenWindows(): Set<Hwnd> {
+    const taken = new Set<Hwnd>(this.#tiler?.entries.map((e) => e.hwnd).filter(Boolean));
+    if (this.#tiler?.main) taken.add(this.#tiler.main);
+    return taken;
+  }
+
+  /**
+   * After open() gave up (timeout, agent closed, disposed): keep looking for
+   * the window in the background for another `timeoutMs`, and close it if
+   * it shows up, so it is not left behind as an orphan.
+   */
+  #closeWhenItAppears(title: string, before: ReadonlySet<Hwnd>, timeoutMs: number): void {
+    const win32 = this.#win32!;
+    const unrefSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.());
+    void discoverWindow(win32, title, before, { timeoutMs, pollMs: 100, sleep: unrefSleep })
+      .then((late) => {
+        if (!late || this.#takenWindows().has(late)) return;
+        this.#log(`window ${late} appeared after its open() was given up; closing it`);
+        win32.postMessage(late, WM_CLOSE);
+      })
+      .catch(() => {});
   }
 
   /**
@@ -348,7 +399,7 @@ export class WindowsTerminalBackend implements PaneBackend {
    * window of the same burst; that counts as stolen too. Any other window
    * means the user moved on, and we leave the focus alone.
    */
-  async #returnFocus(previous: Hwnd, launched: Hwnd): Promise<void> {
+  async #returnFocus(previous: Hwnd, launched: Hwnd, agentId: string): Promise<void> {
     const win32 = this.#win32!;
     this.#recentLaunches.set(launched, Date.now());
     try {
@@ -366,6 +417,7 @@ export class WindowsTerminalBackend implements PaneBackend {
         if (now && win32.isWindow(previous)) {
           if (!win32.setForegroundWindow(previous)) {
             this.#log("could not give the focus back to the previous window");
+            this.#safe(() => this.#events.onFocusNotReturned?.({ agentId }));
             return;
           }
           restoredAt = Date.now();

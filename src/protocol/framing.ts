@@ -12,6 +12,30 @@ import { isSupportedVersion } from "./version.ts";
 /** Default maximum line length in bytes, excluding the line terminator. */
 export const DEFAULT_MAX_LINE_BYTES = 1024 * 1024;
 
+/**
+ * Largest free text (task, steer message, done summary) that goes into one
+ * message, measured as its JSON-encoded size. Leaves ample room for the
+ * envelope within DEFAULT_MAX_LINE_BYTES (docs/protocol.md, section 2).
+ */
+export const MAX_TEXT_BYTES = 512 * 1024;
+
+/** Size of `text` once JSON-encoded (escapes included), in UTF-8 bytes. */
+export function encodedTextBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text), "utf8");
+}
+
+/** Shorten `text` so that its encoded size fits `maxBytes`, marking the cut. */
+export function truncateText(text: string, maxBytes = MAX_TEXT_BYTES): string {
+  if (encodedTextBytes(text) <= maxBytes) return text;
+  const marker = "\n… (truncated by pi-dogs)";
+  let cut = text;
+  for (;;) {
+    const size = encodedTextBytes(cut + marker);
+    if (size <= maxBytes || cut.length === 0) return cut + marker;
+    cut = cut.slice(0, Math.max(0, Math.floor((cut.length * maxBytes) / size) - 1));
+  }
+}
+
 export type FramingErrorCode =
   | "LINE_TOO_LONG"
   | "INVALID_UTF8"
@@ -172,8 +196,8 @@ const AGENT_STATES: readonly AgentState[] = ["starting", "running", "idle", "clo
 /** Required payload fields per message type. A "?" suffix marks optional fields. */
 const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
   hello: { token: "string", pid: "number", piVersion: "string", protocol: "number", "reconnect?": "boolean" },
-  welcome: { config: "object", resumed: "boolean" },
-  reject: { reason: "string" },
+  welcome: { config: "object", resumed: "boolean", hubSecret: "string" },
+  reject: { reason: "string", "hubSecret?": "string" },
   ack: { ref: "string" },
   task: { text: "string" },
   status: { state: AGENT_STATES, "tool?": "string", usage: "object", model: "string" },
@@ -189,7 +213,35 @@ const PAYLOAD_FIELDS: Record<MessageType, Record<string, FieldSpec>> = {
   pong: {},
 };
 
-const EVENT_KINDS = ["text_delta", "tool_start", "tool_end", "user_message"];
+/** Payload fields per event kind, checked with the same rules as PAYLOAD_FIELDS. */
+const EVENT_FIELDS: Record<string, Record<string, FieldSpec>> = {
+  text_delta: { text: "string" },
+  tool_start: { toolCallId: "string", tool: "string", "args?": "string" },
+  tool_end: { toolCallId: "string", tool: "string", isError: "boolean" },
+  user_message: { text: "string", source: ["hub", "user"] },
+};
+
+const USAGE_FIELDS: Record<string, FieldSpec> = {
+  input: "number",
+  output: "number",
+  "cacheRead?": "number",
+  "cacheWrite?": "number",
+  "cost?": "number",
+};
+
+const CONFIG_FIELDS: Record<string, FieldSpec> = {
+  mode: ["autonomous", "interactive"],
+  closeOnDone: "boolean",
+  hubGoneGraceMs: "number",
+  name: "string",
+};
+
+/** Nested objects checked per message type: field name -> its payload fields. */
+const NESTED_FIELDS: Partial<Record<MessageType, Record<string, Record<string, FieldSpec>>>> = {
+  status: { usage: USAGE_FIELDS },
+  done: { usage: USAGE_FIELDS },
+  welcome: { config: CONFIG_FIELDS },
+};
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -228,21 +280,30 @@ export function parseMessage(line: string): Message {
   if (value.id !== undefined && typeof value.id !== "string") {
     throw new FramingError("INVALID_MESSAGE", `"${type}": field "id" must be a string`);
   }
-  for (const [key, spec] of Object.entries(PAYLOAD_FIELDS[type as MessageType])) {
+  checkFields(type, "", value, PAYLOAD_FIELDS[type as MessageType]);
+  for (const [field, specs] of Object.entries(NESTED_FIELDS[type as MessageType] ?? {})) {
+    checkFields(type, `${field}.`, value[field] as Record<string, unknown>, specs);
+  }
+  if (type === "event") {
+    const event = value.event as Record<string, unknown>;
+    const kind = event.kind;
+    if (typeof kind !== "string" || !Object.hasOwn(EVENT_FIELDS, kind)) {
+      throw new FramingError("INVALID_MESSAGE", `"event": unknown event kind ${JSON.stringify(kind)}`);
+    }
+    checkFields(type, "event.", event, EVENT_FIELDS[kind]!);
+  }
+  return value as unknown as Message;
+}
+
+function checkFields(type: string, prefix: string, value: Record<string, unknown>, specs: Record<string, FieldSpec>): void {
+  for (const [key, spec] of Object.entries(specs)) {
     const optional = key.endsWith("?");
     const name = optional ? key.slice(0, -1) : key;
     const field = value[name];
     if (optional && field === undefined) continue;
     if (!matches(field, spec)) {
       const expected = Array.isArray(spec) ? `one of ${spec.join(", ")}` : `a ${spec}`;
-      throw new FramingError("INVALID_MESSAGE", `"${type}": field "${name}" must be ${expected}`);
+      throw new FramingError("INVALID_MESSAGE", `"${type}": field "${prefix}${name}" must be ${expected}`);
     }
   }
-  if (type === "event") {
-    const kind = (value.event as Record<string, unknown>).kind;
-    if (typeof kind !== "string" || !EVENT_KINDS.includes(kind)) {
-      throw new FramingError("INVALID_MESSAGE", `"event": unknown event kind ${JSON.stringify(kind)}`);
-    }
-  }
-  return value as unknown as Message;
 }

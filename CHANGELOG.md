@@ -37,3 +37,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Tests: unit, integration over real named pipes with a fake backend, and an
   end-to-end suite (`npm run test:e2e`) with real pi, Windows Terminal and a
   local model.
+
+### Security
+
+- Dogs authenticate the hub: a per-dog `hubSecret` from the launch file must
+  come back in `welcome`; anything a peer sends before that is ignored. The
+  pipe name gets a random suffix (`\\.\pipe\pi-dogs-<pid>-<random>`).
+- Mirrored text and tool arguments are stripped of terminal control
+  characters.
+
+### Fixed
+
+- A malformed message or an error in a pipe handler no longer ends the main
+  pi; nested payloads are validated; tasks and steer messages over 512 KiB
+  are refused with a clear error, and long summaries are truncated.
+- `/reload`, `/new`, `/resume` or `/fork` typed inside a dog no longer ends
+  it.
+- A result that crosses a kill no longer overrides it (and no longer starts
+  a main-agent turn during quit); kill settings and in-flight kills survive
+  a `/reload`, and a dog reconnecting during a kill gets `shutdown` again.
+- A takeover made while the pipe was down reaches the hub after reconnect.
+- Closing a dog window by hand is reported as stopped, not as a crash.
+- After a `/reload` only the new hub reports results; window closes during
+  the reload are no longer lost.
+- A dog in another folder no longer hangs at pi's project-trust prompt; a
+  dog whose launch file is missing quits.
+- Also: no orphaned `starting` dog when a start fails; finished dogs kept
+  open are shut down on quit; `/dogs setup-keys` understands the legacy
+  `selectModel` name; `/dogs steer` and `/dogs new` keep the text verbatim;
+  PID reuse no longer keeps a lost dog forever; only the 20 most recent
+  finished dogs are kept; results of dogs from before `/new` or `/resume`
+  no longer trigger a turn; the launcher also starts when reached through a
+  junction, symlink or `subst` drive; the user is told when a dog window
+  kept the keyboard focus.

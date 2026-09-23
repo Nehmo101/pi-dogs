@@ -41,9 +41,10 @@ export interface MergePlan {
  * the target; if it is configured and still contains Ctrl+L, replace just
  * that key; otherwise keep the user's value.
  */
-export function planKeybindingsMerge(existing: KeybindingsFile, target = REMAP_TARGET): MergePlan {
-  const result: KeybindingsFile = { ...existing };
+export function planKeybindingsMerge(original: KeybindingsFile, target = REMAP_TARGET): MergePlan {
   const changes: string[] = [];
+  const existing = normalizeLegacyNames(original, changes);
+  const result: KeybindingsFile = { ...existing };
   for (const action of CTRL_L_ACTIONS) {
     const current = existing[action];
     if (current === undefined) {
@@ -62,8 +63,32 @@ export function planKeybindingsMerge(existing: KeybindingsFile, target = REMAP_T
   return { result, changes, conflicts };
 }
 
+/**
+ * Old (pre-namespace) action names pi still accepts and migrates, for the
+ * actions we touch. pi prefers the new name when both are present.
+ */
+export const LEGACY_ACTION_NAMES: Readonly<Record<string, string>> = { selectModel: "app.model.select" };
+
+/** Rename legacy entries to their current names, as pi's own migration does. */
+export function normalizeLegacyNames(existing: KeybindingsFile, changes: string[] = []): KeybindingsFile {
+  const out: KeybindingsFile = { ...existing };
+  for (const [legacy, current] of Object.entries(LEGACY_ACTION_NAMES)) {
+    if (!Object.hasOwn(out, legacy)) continue;
+    const value = out[legacy]!;
+    delete out[legacy];
+    if (Object.hasOwn(out, current)) {
+      changes.push(`${legacy}: removed (superseded by ${current})`);
+    } else {
+      out[current] = value;
+      changes.push(`${legacy}: renamed to ${current}`);
+    }
+  }
+  return out;
+}
+
 /** Whether Ctrl+L is still taken by `app.model.select` (then an extension cannot use it). */
-export function isOverlayKeyReserved(existing: KeybindingsFile): boolean {
+export function isOverlayKeyReserved(original: KeybindingsFile): boolean {
+  const existing = normalizeLegacyNames(original);
   const current = existing["app.model.select"];
   return current === undefined || hasKey(current, OVERLAY_KEY);
 }

@@ -110,6 +110,12 @@ export interface WelcomeMessage extends Envelope<"welcome"> {
   config: AgentConfig;
   /** True when the hub already knows this agent (reconnect); no new `task` follows. */
   resumed: boolean;
+  /**
+   * The per-agent hub secret from the launch file. The agent verifies it and
+   * drops the connection otherwise, so a squatter on the pipe name cannot
+   * pose as the hub.
+   */
+  hubSecret: string;
 }
 
 /** Acknowledges a message that carried an `id` (currently `done`). */
@@ -119,6 +125,8 @@ export interface AckMessage extends Envelope<"ack"> {
 
 export interface RejectMessage extends Envelope<"reject"> {
   reason: string;
+  /** Present when the hub knows the agent; the agent only honours a reject that carries its hub secret. */
+  hubSecret?: string;
 }
 
 export interface TaskMessage extends Envelope<"task"> {

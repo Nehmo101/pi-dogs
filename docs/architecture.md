@@ -18,7 +18,7 @@ tiling in [window-backend.md](window-backend.md).
 │  tools.ts / commands.ts / ui/ (dock, overlay) / models.ts / …    │
 │  PaneBackend ── src/backend/windows-terminal/ (koffi, Win32)     │
 └───────────────▲──────────────────────────────┬───────────────────┘
-                │ JSONL over \\.\pipe\pi-dogs-<main pid>
+                │ JSONL over \\.\pipe\pi-dogs-<main pid>-<random>
                 │                              │ wt.exe … -- node launcher.mjs launch.json
 ┌───────────────┴──────────── dog window ──────▼───────────────────┐
 │ launcher.mjs → node <pi cli.js> --session … -e agent/index.ts …  │
@@ -49,8 +49,11 @@ tiling in [window-backend.md](window-backend.md).
    an unknown model is a tool error with suggestions.
 3. `Hub.spawn` picks a unique dog name, derives the technical `agentId`,
    seeds the dog's session file (v3 header + a `custom_message` with the
-   caller's context, or a copy of the main branch for `fork`), creates a
-   one-time token and writes the launch file.
+   caller's context, or a copy of the main branch for `fork`), creates the
+   dog's two secrets (the `token` it presents in `hello`, the `hubSecret`
+   the hub echoes in `welcome`) and writes the launch file. The pi command
+   line always settles project trust (`--approve` / `--no-approve`, see
+   `dogProjectTrust`), so a dog never waits at pi's trust prompt.
 4. The backend opens a window running `node launcher.mjs <launch.json>`.
    The launcher starts pi with inherited stdio: the same pi installation as
    the main pi (`process.execPath` + `process.argv[1]`), never through the
@@ -85,10 +88,12 @@ and the session file (so a dog can be resumed with `pi --session <file>`).
 |---|---|
 | Dog never connects | After `helloTimeoutMs` (30 s) it is `failed`; the window stays open for diagnosis. |
 | pi crashes in a dog | The pipe drops without `done`; the launcher's exit file shows the exit code → `failed`, reported with the session file. |
-| User closes a dog window | pi process gone, no exit file → `killed` ("window closed"). |
+| User closes a dog window | The backend reports the window gone and the hub records `windowClosed` on the dog; when pi is gone it is `killed` ("window closed"), whatever exit code pi got from the closing console (typically `0xC000013A`). Only a crash exit file written *before* the window vanished still counts as `failed`. |
+| A dog is killed while it reports | A `done` that crosses the `shutdown` is acknowledged, but the kill wins: `killed`, reported as the kill asked (`subagent_kill` and quit: no report; `/dogs kill`: report without a turn). |
+| `/reload`, `/new`, `/resume`, `/fork` inside a dog | The dog's extension runtime is re-created in the same process; connection and state move to the next runtime via `globalThis`, and `bye` is sent only on a real quit. |
 | User quits a dog with `/quit` | `bye` without `done` → `killed` ("closed by the user"). |
-| `/reload`, `/new`, `/resume` in the main pi | `session_shutdown` with a reason other than `quit`: the hub snapshots its registry into `globalThis` (module state does not survive a reload), closes the pipe **without** stopping dogs, and the next runtime re-listens on the same pipe name. Dogs reconnect with their token; a `done` sent in between is re-sent and delivered. The window backend instance is also carried over (it owns native window handles). |
-| Main pi quits | `session_shutdown{reason: "quit"}` is awaited: every dog gets `shutdown`, the hub waits `quitGraceMs`, then kills the dog's pi (`taskkill /PID <pid from hello> /T /F`). Killing pi rather than the launcher lets the launcher record the exit and close its window with code 0. |
+| `/reload`, `/new`, `/resume` in the main pi | `session_shutdown` with a reason other than `quit`: the hub snapshots its registry into `globalThis` (module state does not survive a reload), closes the pipe **without** stopping dogs, and the next runtime re-listens on the same pipe name. Dogs reconnect with their token; a `done` sent in between is re-sent and delivered. The window backend instance is also carried over (it owns native window handles); window closes in the gap are buffered and replayed to the new hub. An in-flight kill is resumed with its report settings (they live on the dog's record), and the old runtime ignores everything once stopped. After `/new` or `/resume` results of older dogs arrive without triggering a turn, marked as coming from an earlier session. |
+| Main pi quits | `session_shutdown{reason: "quit"}` is awaited: every dog (also a finished one still open with `closeOnDone: false`) gets `shutdown`, the hub waits `quitGraceMs`, then kills the dog's pi (`taskkill /PID <pid from hello> /T /F`). Killing pi rather than the launcher lets the launcher record the exit and close its window with code 0. |
 | Main pi window closed hard | No `session_shutdown`. Dogs lose the pipe, retry for `hubGoneGraceMs`, then quit (or stay open when `killChildrenOnExit` is false). |
 | Connection hangs | Hub pings every 5 s and drops connections silent for 15 s; the agent does the same and reconnects. |
 

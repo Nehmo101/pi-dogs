@@ -27,7 +27,7 @@ describe("hub robustness", () => {
     for (const h of harnesses.splice(0)) await h.cleanup();
   });
   const track = (h: Harness) => (harnesses.push(h), h);
-  const agent = (file: string, options?: ConstructorParameters<typeof SimAgent>[1]) => {
+  const agent = (file: ConstructorParameters<typeof SimAgent>[0], options?: ConstructorParameters<typeof SimAgent>[1]) => {
     const a = new SimAgent(file, options);
     agents.push(a);
     return a.connect();

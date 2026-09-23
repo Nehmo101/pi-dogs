@@ -37,6 +37,14 @@ export class FakeWin32 implements Win32 {
   posted: [Hwnd, number][] = [];
   /** Refuse SetForegroundWindow (foreground lock). */
   lockForeground = false;
+  /** Windows that report IsHungAppWindow. */
+  hung = new Set<Hwnd>();
+  /** Windows whose thread is in a move/size loop. */
+  inMoveSize = new Set<Hwnd>();
+  mouseDown = false;
+  /** Make every DeferWindowPos batch fail (the fallback uses setWindowPos). */
+  failDefer = false;
+  singles: WindowPlacement[] = [];
   #next = 1000;
 
   addWindow(init: Partial<FakeWindow> & { frame?: Rect } = {}): FakeWindow {
@@ -95,6 +103,15 @@ export class FakeWin32 implements Win32 {
   isZoomed(hwnd: Hwnd): boolean {
     return this.windows.get(hwnd)?.zoomed ?? false;
   }
+  isHung(hwnd: Hwnd): boolean {
+    return this.hung.has(hwnd);
+  }
+  isInMoveSize(hwnd: Hwnd): boolean {
+    return this.inMoveSize.has(hwnd);
+  }
+  isMouseButtonDown(): boolean {
+    return this.mouseDown;
+  }
   getWindowRect(hwnd: Hwnd): Rect | undefined {
     const w = this.windows.get(hwnd);
     return w ? { ...w.outer } : undefined;
@@ -123,11 +140,19 @@ export class FakeWin32 implements Win32 {
     return true;
   }
   deferWindowPos(placements: readonly WindowPlacement[]): boolean {
+    if (this.failDefer) return false;
     this.batches.push(placements.map((p) => ({ ...p })));
     for (const p of placements) {
       const w = this.windows.get(p.hwnd);
       if (w) w.outer = { x: p.x, y: p.y, width: p.width, height: p.height };
     }
+    return true;
+  }
+  setWindowPos(p: WindowPlacement): boolean {
+    const w = this.windows.get(p.hwnd);
+    if (!w) return false;
+    this.singles.push({ ...p });
+    w.outer = { x: p.x, y: p.y, width: p.width, height: p.height };
     return true;
   }
   setForegroundWindow(hwnd: Hwnd): boolean {

@@ -1,13 +1,59 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { canTransition, InvalidTransitionError, isTerminal, Registry, type NewDog } from "../../src/hub/registry.ts";
+import { canTransition, InvalidTransitionError, isTerminal, Registry, stripControls, type NewDog } from "../../src/hub/registry.ts";
 import type { AgentState } from "../../src/protocol/types.ts";
+
+describe("mirror sanitizing and pruning", () => {
+  const rec = (agentId: string, startedAt: number): NewDog => ({
+    agentId,
+    name: agentId,
+    token: "t",
+    hubSecret: "h",
+    color: "#ffffff",
+    model: "m/x",
+    mode: "autonomous",
+    cwd: ".",
+    task: "t",
+    closeOnDone: true,
+    sessionFile: "s",
+    runDir: "r",
+    launchFile: "l",
+    exitFile: "e",
+    startedAt,
+  });
+
+  it("strips terminal control sequences but keeps newlines and tabs", () => {
+    assert.equal(stripControls("a\u001b[2J\u001b]0;pwned\u0007b\tc\r\u009bd"), "a[2J]0;pwnedb\tcd");
+    const r = new Registry();
+    r.add(rec("a", 1));
+    r.applyEvent("a", { kind: "text_delta", text: "x\u001b[31my\nz" }, 1);
+    r.applyEvent("a", { kind: "tool_start", toolCallId: "c", tool: "ba\u001bsh", args: "ls\u0007" }, 2);
+    r.applyEvent("a", { kind: "user_message", text: "hi\u001b[1A", source: "user" }, 3);
+    assert.deepEqual(r.get("a")!.mirror, [
+      { kind: "text", text: "x[31my" },
+      { kind: "text", text: "z" },
+      { kind: "tool", tool: "bash", args: "ls", status: "running", toolCallId: "c" },
+      { kind: "user", text: "hi[1A", source: "user" },
+    ]);
+  });
+
+  it("drops the oldest finished dogs beyond the limit, never live ones", () => {
+    const r = new Registry();
+    for (let i = 0; i < 5; i++) {
+      r.add(rec(`d${i}`, i));
+      if (i !== 1) r.transition(`d${i}`, "killed", i);
+    }
+    r.pruneTerminal(2);
+    assert.deepEqual(r.all().map((d) => d.agentId), ["d1", "d3", "d4"]);
+  });
+});
 
 const dog = (agentId: string, name: string, startedAt = 1000): NewDog => ({
   agentId,
   name,
   token: "t",
+  hubSecret: "h",
   color: "#ffffff",
   model: "ollama/qwen3.5:4b",
   mode: "autonomous",

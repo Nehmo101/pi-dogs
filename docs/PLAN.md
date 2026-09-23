@@ -431,6 +431,6 @@ Details: `docs/spike/layout.md` und `docs/spike/pi-api.md`. Dieser Abschnitt hat
 - **Zustand `closing`:** Nach `done` bekommt ein Agent keine Arbeit mehr; neuer Zustand in der Registry.
 - **Launcher endet immer mit Code 0.** Der echte Rückgabewert steht in `exit.json`, sonst lässt Windows Terminal tote Tabs offen.
 - **Beenden der Kinder:** Die Fenster sind keine Kindprozesse des Haupt-Pi. Deshalb zuerst `shutdown` über die Pipe (im `session_shutdown`-Handler abwarten, ~80 ms), danach `taskkill` auf die Pi-PID aus `hello`.
-- **Strg+L:** Pi schützt die Taste als eingebautes Kürzel, eine Erweiterung kann sie nicht übernehmen. pi-dogs bringt den Befehl `/dogs setup-keys` mit: Er legt `app.model.select` auf `ctrl+alt+l` um (und `app.tree.filter.labeledOnly` passend) und fragt vorher nach. Bis dahin öffnet `Strg+Alt+D` das Overlay (Ausweichkürzel).
+- **Strg+L:** Pi schützt die Taste als eingebautes Kürzel, eine Erweiterung kann sie nicht übernehmen. pi-dogs bringt den Befehl `/dogs setup-keys` mit: Er legt `app.model.select` auf `ctrl+alt+l` um (und `app.tree.filter.labeledOnly` passend) und fragt vorher nach. Bis dahin öffnet `Alt+M` das Overlay (Ausweichkürzel).
 - **Leiste:** Text-Widgets sind auf 10 Zeilen begrenzt; bei mehr Agenten wird eine eigene Komponente verwendet. 4 Aktualisierungen pro Sekunde flackern nicht.
 - **Sitzung vorbereiten:** v3-Kopf plus ein `custom_message`-Eintrag mit dem Kontext, Start per `pi --session <datei>`.

@@ -14,6 +14,18 @@ import {
 } from "../../src/hub/keybindings.ts";
 
 describe("planKeybindingsMerge", () => {
+  it("understands pi's legacy action name selectModel", () => {
+    // pi migrates selectModel to app.model.select; a merge must not leave Ctrl+L bound through it.
+    assert.equal(isOverlayKeyReserved({ selectModel: "ctrl+alt+l" }), false);
+    assert.equal(isOverlayKeyReserved({ selectModel: "ctrl+l" }), true);
+    const plan = planKeybindingsMerge({ selectModel: ["ctrl+l", "f2"], other: "x" });
+    assert.deepEqual(plan.result, { other: "x", "app.model.select": ["ctrl+alt+l", "f2"], "app.tree.filter.labeledOnly": "ctrl+alt+l" });
+    assert.ok(plan.changes.some((c) => /selectModel: renamed/.test(c)));
+    // With both names present pi uses the new one; the stale legacy entry is dropped.
+    assert.deepEqual(planKeybindingsMerge({ selectModel: "ctrl+l", "app.model.select": "f3" }).result["app.model.select"], "f3");
+    assert.equal("selectModel" in planKeybindingsMerge({ selectModel: "ctrl+l", "app.model.select": "f3" }).result, false);
+  });
+
   it("adds both remaps to an empty file", () => {
     const plan = planKeybindingsMerge({});
     assert.deepEqual(plan.result, { "app.model.select": "ctrl+alt+l", "app.tree.filter.labeledOnly": "ctrl+alt+l" });
