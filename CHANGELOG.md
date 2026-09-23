@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Dogs inherit `--bash-guard-disabled` from the main pi, so a session started
+  without bash-guard prompts gets prompt-free dogs too.
+
 - Project scaffold (package manifest, CI, license, docs).
 - Protocol v1 message types and JSONL framing (`src/protocol/`).
 - Pure layout engine `computeLayout` (`src/layout/`).

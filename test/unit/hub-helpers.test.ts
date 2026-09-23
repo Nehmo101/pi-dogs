@@ -6,7 +6,7 @@ import { describe, it } from "node:test";
 
 import { parseNewArgs, parseSubcommand, splitDogAndText } from "../../src/hub/command-args.ts";
 import { buildResultText, formatCost, formatElapsed, formatTokens, formatUsage } from "../../src/hub/format.ts";
-import { buildPiArgs, currentPiCommand, dogProjectTrust } from "../../src/hub/pi-command.ts";
+import { buildPiArgs, currentPiCommand, dogProjectTrust, inheritedDogArgs } from "../../src/hub/pi-command.ts";
 import { Registry } from "../../src/hub/registry.ts";
 import { forkableEntries, seedSessionFile, sessionFileName, type SeedEntry } from "../../src/hub/session-seed.ts";
 import { rgb, stateBadge, toRow, visibleDogs } from "../../src/hub/ui/rows.ts";
@@ -205,5 +205,23 @@ describe("dock rows", () => {
     assert.equal(stateBadge(r.get("a")!).text, "reconnecting");
     assert.equal(rgb("#102030", "●"), "\x1b[38;2;16;32;48m●\x1b[39m");
     assert.equal(rgb("nope", "●"), "●");
+  });
+});
+
+describe("inheritedDogArgs", () => {
+  it("passes --bash-guard-disabled on to dogs only when the main pi has it", () => {
+    assert.deepEqual(inheritedDogArgs(["node", "cli.js", "--bash-guard-disabled"]), ["--bash-guard-disabled"]);
+    assert.deepEqual(inheritedDogArgs(["node", "cli.js", "--model", "x"]), []);
+  });
+
+  it("appends the inherited flags last in the dog's arguments", () => {
+    const args = buildPiArgs({
+      agentExtension: "agent.ts",
+      launchFile: "launch.json",
+      sessionFile: "s.jsonl",
+      name: "Bello",
+      extraArgs: ["--bash-guard-disabled"],
+    });
+    assert.equal(args.at(-1), "--bash-guard-disabled");
   });
 });

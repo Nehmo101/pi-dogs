@@ -20,7 +20,7 @@ import type { PiDogsConfig } from "./config.ts";
 import { DOG_NAMES, makeAgentId, pickDogName } from "./dog-names.ts";
 import { buildResultText, elapsedOf, type ResultDetails } from "./format.ts";
 import { modelLabel } from "./models.ts";
-import { buildPiArgs, type PiCommand } from "./pi-command.ts";
+import { buildPiArgs, inheritedDogArgs, type PiCommand } from "./pi-command.ts";
 import { debugLog } from "./log.ts";
 import { isPidAlive, killProcessTree } from "./process.ts";
 import { isTerminal, Registry, type DogOutcome, type DogRecord } from "./registry.ts";
@@ -269,6 +269,7 @@ export class Hub {
         tools: req.tools,
         name,
         approve: req.approve,
+        extraArgs: inheritedDogArgs(),
       });
       writeLaunchFile(launchFile, {
         v: PROTOCOL_VERSION,

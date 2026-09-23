@@ -42,6 +42,20 @@ export interface PiArgsOptions {
    * pi never shows its trust prompt), undefined leaves the decision to pi.
    */
   approve?: boolean | undefined;
+  /** Extra arguments appended last (see `inheritedDogArgs`). */
+  extraArgs?: readonly string[] | undefined;
+}
+
+/**
+ * Flags of the main pi that dogs inherit, so a dog behaves like the session
+ * that started it. Currently only bash-guard's opt-out: a user who starts pi
+ * with `--bash-guard-disabled` gets dogs without confirmation prompts too
+ * (bash-guard's hard-block floor still applies in the dogs).
+ */
+export const INHERITED_FLAGS = ["--bash-guard-disabled"] as const;
+
+export function inheritedDogArgs(mainArgv: readonly string[] = process.argv): string[] {
+  return INHERITED_FLAGS.filter((flag) => mainArgv.includes(flag));
 }
 
 /**
@@ -84,5 +98,6 @@ export function buildPiArgs(o: PiArgsOptions): string[] {
   }
   if (o.approve === true) args.push("--approve");
   else if (o.approve === false) args.push("--no-approve");
+  if (o.extraArgs) args.push(...o.extraArgs);
   return args;
 }

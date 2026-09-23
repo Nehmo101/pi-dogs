@@ -161,6 +161,10 @@ so it never waits at pi's trust prompt.
   (or `PI_DOGS_DEBUG=<file>`).
 - **Resuming a dog** – every result names the dog's session file; continue
   it with `pi --session <file>`.
+- **Confirmation prompts in dog windows (bash-guard)** – dogs inherit
+  `--bash-guard-disabled` from the main pi. Start the main pi with that flag
+  and its dogs run without prompts too; bash-guard's hard-block floor still
+  applies.
 
 ## Documentation
 
