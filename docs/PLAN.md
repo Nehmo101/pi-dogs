@@ -1,6 +1,6 @@
 # Plan: Interaktive Pi-Subagenten für Windows
 
-Stand: 23.09.2026 · Status: Phase 0 abgeschlossen, Umsetzung läuft · Projektname: **pi-dogs**
+Stand: 23.09.2026 · Status: Phasen 0–4 umgesetzt (Alpha), Stand 23.09.2026 früh · Projektname: **pi-dogs**
 
 ---
 
